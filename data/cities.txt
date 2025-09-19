@@ -1,0 +1,5 @@
+# Road-Crossing Video Discovery - Cities List
+# One city per line, comments start with #
+# Format: CityName or CityName,CountryCode
+
+New York
