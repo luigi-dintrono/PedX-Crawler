@@ -20,6 +20,9 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 
+# Import the quality filter
+from video_quality_filter import VideoQualityFilter
+
 
 class QuotaTracker:
     """Tracks YouTube API quota usage."""
@@ -60,11 +63,12 @@ class QuotaTracker:
 class YouTubeDiscovery:
     """Discovers YouTube street-crossing videos by city."""
     
-    def __init__(self, api_key: str, quota_tracker: QuotaTracker = None):
-        """Initialize with YouTube API key and optional quota tracker."""
+    def __init__(self, api_key: str, quota_tracker: QuotaTracker = None, quality_filter: VideoQualityFilter = None):
+        """Initialize with YouTube API key, optional quota tracker, and quality filter."""
         self.api_key = api_key
         self.youtube = build('youtube', 'v3', developerKey=api_key)
         self.quota_tracker = quota_tracker or QuotaTracker()
+        self.quality_filter = quality_filter
         
         # Fix SSL issues on macOS
         ssl._create_default_https_context = ssl._create_unverified_context
@@ -72,15 +76,16 @@ class YouTubeDiscovery:
     def search_videos(self, city: str, max_results: int = 50, since_date: str = '2020-01-01T00:00:00Z', use_single_search: bool = True) -> List[Dict[str, Any]]:
         """
         Search for street-crossing videos in a specific city.
+        Continues searching until it finds the requested number of quality videos.
         
         Args:
             city: City name to search for
-            max_results: Maximum number of results to return
+            max_results: Maximum number of quality videos to return
             since_date: ISO 8601 date string for filtering videos published after this date
             use_single_search: If True, use only one search term to save quota (100 units vs 500)
             
         Returns:
-            List of video metadata dictionaries
+            List of video metadata dictionaries that passed quality filtering
         """
         # Optimize search terms based on quota usage
         if use_single_search:
@@ -96,30 +101,57 @@ class YouTubeDiscovery:
                 f"{city} pedestrian crossing street"
             ]
         
-        all_videos = []
+        quality_videos = []
+        seen_ids = set()
+        search_term_index = 0
+        next_page_token = None
+        max_search_attempts = 10  # Prevent infinite loops
+        search_attempts = 0
         
-        for search_term in search_terms:
+        print(f"  Searching for {max_results} quality videos in {city}...")
+        
+        while len(quality_videos) < max_results and search_attempts < max_search_attempts:
             # Check quota before making request
             if not self.quota_tracker.can_make_search_request():
-                print(f"QUOTA WARNING: Not enough quota to search for '{search_term}'. {self.quota_tracker.get_status()}")
+                print(f"  QUOTA WARNING: Not enough quota to continue searching. {self.quota_tracker.get_status()}")
                 break
-                
+            
+            # Get current search term
+            search_term = search_terms[search_term_index % len(search_terms)]
+            search_attempts += 1
+            
             try:
-                # Search for videos
-                search_response = self.youtube.search().list(
-                    q=search_term,
-                    part='id,snippet',
-                    type='video',
-                    maxResults=min(max_results, 50),
-                    order='relevance',
-                    publishedAfter=since_date  # Filter by date
-                ).execute()
+                # Search for videos with pagination
+                search_params = {
+                    'q': search_term,
+                    'part': 'id,snippet',
+                    'type': 'video',
+                    'maxResults': 50,  # Always get max results per request
+                    'order': 'relevance',
+                    'publishedAfter': since_date
+                }
+                
+                if next_page_token:
+                    search_params['pageToken'] = next_page_token
+                
+                search_response = self.youtube.search().list(**search_params).execute()
                 
                 # Track quota usage
                 self.quota_tracker.add_search_request()
                 
+                # Process videos from this batch
+                videos_processed = 0
                 for item in search_response.get('items', []):
+                    if len(quality_videos) >= max_results:
+                        break
+                        
                     video_id = item['id']['videoId']
+                    
+                    # Skip if we've already seen this video
+                    if video_id in seen_ids:
+                        continue
+                    
+                    seen_ids.add(video_id)
                     snippet = item['snippet']
                     
                     # Get additional video details
@@ -139,28 +171,51 @@ class YouTubeDiscovery:
                             'channel_name': snippet['channelTitle'],
                             'channel_url': f"https://www.youtube.com/channel/{snippet['channelId']}"
                         }
-                        all_videos.append(video_data)
                         
+                        # Apply quality filter if available
+                        if self.quality_filter:
+                            is_quality, filter_reason = self.quality_filter.filter_video(video_data)
+                            if not is_quality:
+                                print(f"    Filtered out: '{snippet['title'][:50]}...' - {filter_reason}")
+                                continue
+                            else:
+                                print(f"    ✓ Quality video: '{snippet['title'][:50]}...'")
+                        else:
+                            print(f"    ✓ Video added: '{snippet['title'][:50]}...'")
+                        
+                        quality_videos.append(video_data)
+                        videos_processed += 1
+                
+                # Check if we have more pages for this search term
+                next_page_token = search_response.get('nextPageToken')
+                if not next_page_token:
+                    # No more pages for this search term, move to next term
+                    search_term_index += 1
+                    next_page_token = None
+                    print(f"  Completed search term: '{search_term}' - Found {len(quality_videos)} quality videos so far")
+                
+                # If we processed no videos in this batch, try next search term
+                if videos_processed == 0 and not next_page_token:
+                    search_term_index += 1
+                    next_page_token = None
+                
             except HttpError as e:
                 if "quotaExceeded" in str(e):
-                    print(f"QUOTA EXCEEDED: Cannot search for '{search_term}'. Please wait 24 hours or request quota increase.")
+                    print(f"  QUOTA EXCEEDED: Cannot search for '{search_term}'. Please wait 24 hours or request quota increase.")
                     raise e  # Re-raise to stop processing
                 else:
-                    print(f"Error searching for '{search_term}': {e}")
+                    print(f"  Error searching for '{search_term}': {e}")
+                    search_term_index += 1
+                    next_page_token = None
                     continue
             except Exception as e:
-                print(f"Unexpected error searching for '{search_term}': {e}")
+                print(f"  Unexpected error searching for '{search_term}': {e}")
+                search_term_index += 1
+                next_page_token = None
                 continue
         
-        # Remove duplicates based on video ID
-        seen_ids = set()
-        unique_videos = []
-        for video in all_videos:
-            if video['id'] not in seen_ids:
-                seen_ids.add(video['id'])
-                unique_videos.append(video)
-        
-        return unique_videos[:max_results]
+        print(f"  Search complete: Found {len(quality_videos)} quality videos out of {len(seen_ids)} total videos processed")
+        return quality_videos[:max_results]
     
     def _get_video_details(self, video_id: str) -> Optional[Dict[str, Any]]:
         """Get detailed information about a specific video."""
@@ -319,11 +374,15 @@ def main():
     parser.add_argument('--cities-file', default='data/cities.txt', help='Path to cities file')
     parser.add_argument('--output', default='data/outputs/discovery.csv', help='Output CSV file path')
     parser.add_argument('--max-results', type=int, default=50, help='Maximum results per city (deprecated, use --per-city)')
-    parser.add_argument('--per-city', type=int, default=50, help='Maximum results per city')
+    parser.add_argument('--per-city', type=int, default=50, help='Maximum quality videos per city (continues searching until target reached)')
     parser.add_argument('--since', default='2020-01-01', help='Filter videos published after this date (YYYY-MM-DD format)')
     parser.add_argument('--use-multiple-search', action='store_true', help='Use multiple search terms per city (uses 5x more quota)')
     parser.add_argument('--quota-limit', type=int, default=10000, help='Daily quota limit (default: 10000)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
+    parser.add_argument('--enable-quality-filter', action='store_true', help='Enable two-stage quality filtering (Stage 1: metadata, Stage 2: YOLO)')
+    parser.add_argument('--max-upload-months', type=int, default=36, help='Maximum age of videos in months for quality filter (default: 36)')
+    parser.add_argument('--yolo-model', default='yolo11n.pt', help='Path to YOLO11 model file (default: yolo11n.pt)')
+    parser.add_argument('--temp-dir', default='tmp', help='Directory for temporary files (default: tmp)')
     
     args = parser.parse_args()
     
@@ -357,6 +416,20 @@ def main():
     # Initialize quota tracker
     quota_tracker = QuotaTracker(daily_limit=args.quota_limit)
     
+    # Initialize quality filter if enabled
+    quality_filter = None
+    if args.enable_quality_filter:
+        try:
+            quality_filter = VideoQualityFilter(
+                max_upload_months=args.max_upload_months,
+                yolo_model_path=args.yolo_model,
+                temp_dir=args.temp_dir
+            )
+            print("Quality filter initialized successfully")
+        except Exception as e:
+            print(f"Warning: Could not initialize quality filter: {e}")
+            print("Continuing without quality filtering...")
+    
     # Load cities
     cities = load_cities(args.cities_file)
     if args.verbose:
@@ -365,10 +438,11 @@ def main():
         print(f"Maximum {per_city} videos per city")
         print(f"Search mode: {'Multiple terms (5x quota)' if args.use_multiple_search else 'Single term (optimized)'}")
         print(f"Quota limit: {args.quota_limit:,} units")
+        print(f"Quality filter: {'Enabled' if quality_filter else 'Disabled'}")
         print(f"Estimated quota usage: {len(cities) * (500 if args.use_multiple_search else 100):,} units")
     
     # Initialize discovery tool
-    discovery = YouTubeDiscovery(api_key, quota_tracker)
+    discovery = YouTubeDiscovery(api_key, quota_tracker, quality_filter)
     
     # Discover videos for each city
     all_videos = []

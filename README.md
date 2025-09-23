@@ -5,12 +5,14 @@ A minimal, production-lean MVP that discovers YouTube street-crossing videos by 
 ## Features
 
 - 🔍 Discovers YouTube street-crossing videos by city using tuned search terms
+- 🎯 **Two-stage quality filtering** - Ensures only high-quality videos are added to CSV
 - 📊 Outputs CSV with columns: `id`, `name`, `city`, `video`, `video_url`, `time_of_day`, `start_time`, `end_time`, `region_code`, `channel_name`, `channel_url`
 - 🔐 Secure API key handling (supports `.env` and `--api-key-file`)
 - 🍎 macOS SSL issue fixes included
 - 🚀 Easy local and CI execution via Makefile
 - ⚡ Quota-optimized search (5x more cities with same API quota)
 - 📈 Real-time quota monitoring and management
+- 🎯 **Smart video counting** - Continues searching until requested number of quality videos found
 
 ## Quick Start
 
@@ -28,6 +30,11 @@ A minimal, production-lean MVP that discovers YouTube street-crossing videos by 
 3. **Run PedX crawler:**
    ```bash
    make run
+   ```
+
+4. **Run with quality filtering (recommended):**
+   ```bash
+   make run-filtered
    ```
 
 ## API Key Setup
@@ -81,14 +88,24 @@ python3 crawler/pedx-crawler.py --since 2024-01-01 --per-city 50 --verbose
 python3 crawler/pedx-crawler.py --since 2024-01-01 --per-city 50 --use-multiple-search --verbose
 ```
 
+### Quality filtering mode (recommended)
+```bash
+# Enables two-stage quality filtering to ensure only high-quality videos
+python3 crawler/pedx-crawler.py --enable-quality-filter --per-city 10 --verbose
+```
+
 ### Makefile targets
 - `make install` - Install Python dependencies
 - `make setup` - Copy .env.example to .env
 - `make run` - Run PedX crawler with default settings
 - `make run-verbose` - Run with verbose output
+- `make run-filtered` - Run with quality filter enabled
 - `make test` - Test with small sample (5 results per city)
+- `make test-filtered` - Test with quality filter (2 videos per city)
+- `make test-filtered-recent` - Test with quality filter + recent date
 - `make test-custom` - Test with custom date and per-city limit
 - `make clean` - Clean output files
+- `make clean-temp` - Clean temporary files from quality filter
 - `make ci-run` - CI-friendly run (assumes API key in environment)
 
 ## Configuration
@@ -114,6 +131,63 @@ The script generates a CSV file with the following columns:
 - `region_code` - Country code (extracted from city)
 - `channel_name` - YouTube channel name
 - `channel_url` - YouTube channel URL
+
+## Quality Filtering
+
+The PedX Crawler includes an advanced two-stage quality filtering system to ensure only high-quality street crossing videos are added to your dataset.
+
+### Overview
+
+**Stage 1: Metadata Heuristic Filtering** (Fast)
+- Duration: 10 seconds - 20 minutes
+- Upload date: Within last N months (default: 36)
+- Title keywords: Must contain crosswalk, zebra crossing, pedestrian crossing, jaywalking, or intersection
+- Rejects: Compilations, fails, memes, shorts, and off-topic content
+
+**Stage 2: Micro-clip YOLO Analysis** (Thorough)
+- Downloads first 3 seconds of each video
+- Extracts 3 frames using ffmpeg
+- Runs YOLO11 object detection
+- Detects person + vehicle co-occurrence
+- Detects traffic lights + people/vehicles
+- Ensures videos show actual street crossing scenarios
+
+### Smart Video Counting
+
+**Important**: The crawler now continues searching until it finds the requested number of **quality videos** that pass the filter, not just total videos processed.
+
+- `--per-city 5` means **5 quality videos** that pass the filter
+- If 70% of videos are filtered out, the crawler will process ~17 videos to find 5 quality ones
+- Uses pagination and multiple search terms to ensure enough quality content
+- Guarantees your CSV contains exactly the number of high-quality videos requested
+
+### Usage
+
+```bash
+# Enable quality filtering
+python3 crawler/pedx-crawler.py --enable-quality-filter --per-city 10 --verbose
+
+# With recent videos only
+python3 crawler/pedx-crawler.py --enable-quality-filter --since 2025-01-01 --per-city 5 --verbose
+
+# Using Makefile
+make test-filtered-recent
+```
+
+### Dependencies for Quality Filtering
+
+```bash
+# Install all dependencies (including quality filter deps)
+pip install -r crawler/requirements.txt
+brew install ffmpeg  # macOS
+```
+
+**Note**: All quality filter dependencies are now included in `requirements.txt`, so a single `pip install -r crawler/requirements.txt` will install everything needed.
+
+### Detailed Documentation
+
+For comprehensive information about the quality filtering system, see:
+**[📖 Quality Filter Documentation](crawler/QUALITY_FILTER_README.md)**
 
 ## Search Strategy
 
@@ -165,9 +239,17 @@ Request quota increases in [Google Cloud Console](https://console.cloud.google.c
 
 ## Dependencies
 
+### Core Dependencies
 - `google-api-python-client` - YouTube API client
 - `python-dotenv` - Environment variable loading
 - `requests` - HTTP requests
+
+### Quality Filter Dependencies (Optional)
+- `ultralytics` - YOLO11 object detection
+- `opencv-python` - Image processing
+- `numpy` - Numerical operations
+- `yt-dlp` - YouTube video downloading
+- `ffmpeg` - Video processing (system dependency)
 
 ## Troubleshooting
 
@@ -184,20 +266,29 @@ YouTube API has daily quotas. The script includes:
 ### Rate Limiting
 The script includes error handling for rate limits and API errors.
 
+### Quality Filter Issues
+- **YOLO model not found**: The model will be downloaded automatically on first use
+- **yt-dlp not found**: Install all dependencies with `pip install -r crawler/requirements.txt`
+- **ffmpeg not found**: Install with `brew install ffmpeg` (macOS) or `apt install ffmpeg` (Ubuntu)
+- **Memory issues**: Use smaller `--per-city` values or disable Stage 2 filtering
+- **Slow processing**: Quality filtering may take longer as it processes more videos to find quality ones
+
 ## Project Structure
 
 ```
 .
 ├── crawler/
-│   ├── pedx-crawler.py           # Main PedX crawler script
-│   └── requirements.txt          # Python dependencies
+│   ├── pedx-crawler.py              # Main PedX crawler script
+│   ├── video_quality_filter.py      # Two-stage quality filtering system
+│   ├── requirements.txt             # Python dependencies
+│   └── QUALITY_FILTER_README.md     # Detailed quality filter documentation
 ├── data/
-│   ├── cities.txt               # Input cities list
-│   └── outputs/                 # Output CSV files (gitignored)
-├── .env.example                 # Environment template
-├── .gitignore                   # Git ignore rules
-├── Makefile                     # Build automation
-└── README.md                    # This file
+│   ├── cities.txt                   # Input cities list
+│   └── outputs/                     # Output CSV files (gitignored)
+├── .env.example                     # Environment template
+├── .gitignore                       # Git ignore rules
+├── Makefile                         # Build automation
+└── README.md                        # This file
 ```
 
 ## License
