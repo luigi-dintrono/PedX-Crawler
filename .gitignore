@@ -29,8 +29,8 @@ env/
 ENV/
 
 # Output data
-data/outputs/
-*.csv
+# data/outputs/
+# *.csv
 
 # IDE
 .vscode/
