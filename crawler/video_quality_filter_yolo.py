@@ -180,22 +180,72 @@ class VideoQualityFilter:
         output_path = self.temp_dir / f"{video_id}.mp4"
         
         try:
+            # Try system yt-dlp first with robust format selector
+            # Use format selector that works better with new YouTube restrictions
             cmd = [
                 'yt-dlp',
-                '-f', 'mp4',
+                '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
                 '--download-sections', '*0-3',
-                '--max-filesize', '4M',
+                '--max-filesize', '10M',  # Increased from 4M for better success rate
+                '--no-check-certificate',
+                '--extractor-args', 'youtube:player_client=android',  # Use android client to bypass SABR
+                '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36',
+                '--merge-output-format', 'mp4',
                 '-o', str(output_path),
                 video_url
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            if result.returncode == 0 and output_path.exists():
-                return str(output_path)
-            else:
-                print(f"yt-dlp failed for {video_id}: {result.stderr}")
-                return None
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0 and output_path.exists():
+                    return str(output_path)
+                else:
+                    # Fallback to Python module
+                    print(f"System yt-dlp failed, trying Python module for {video_id}")
+                    cmd = [
+                        'python3', '-m', 'yt_dlp',
+                        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
+                        '--download-sections', '*0-3',
+                        '--max-filesize', '10M',
+                        '--no-check-certificate',
+                        '--extractor-args', 'youtube:player_client=android',
+                        '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36',
+                        '--merge-output-format', 'mp4',
+                        '-o', str(output_path),
+                        video_url
+                    ]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                    
+                    if result.returncode == 0 and output_path.exists():
+                        return str(output_path)
+                    else:
+                        print(f"yt-dlp failed for {video_id}: {result.stderr}")
+                        return None
+            except FileNotFoundError:
+                # System yt-dlp not found, try Python module directly
+                print(f"System yt-dlp not found, trying Python module for {video_id}")
+                cmd = [
+                    'python3', '-m', 'yt_dlp',
+                    '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
+                    '--download-sections', '*0-3',
+                    '--max-filesize', '10M',
+                    '--no-check-certificate',
+                    '--extractor-args', 'youtube:player_client=android',
+                    '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36',
+                    '--merge-output-format', 'mp4',
+                    '-o', str(output_path),
+                    video_url
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0 and output_path.exists():
+                    return str(output_path)
+                else:
+                    print(f"yt-dlp failed for {video_id}: {result.stderr}")
+                    return None
                 
         except subprocess.TimeoutExpired:
             print(f"yt-dlp timeout for {video_id}")

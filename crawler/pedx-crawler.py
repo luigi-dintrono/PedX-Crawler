@@ -20,8 +20,9 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 
-# Import the quality filter
-from video_quality_filter import VideoQualityFilter
+# Import the quality filters
+from video_quality_filter_yolo import VideoQualityFilter
+from video_quality_filter_internvl3 import VideoQualityFilterInternVL3
 
 
 class QuotaTracker:
@@ -63,7 +64,7 @@ class QuotaTracker:
 class YouTubeDiscovery:
     """Discovers YouTube street-crossing videos by city."""
     
-    def __init__(self, api_key: str, quota_tracker: QuotaTracker = None, quality_filter: VideoQualityFilter = None):
+    def __init__(self, api_key: str, quota_tracker: QuotaTracker = None, quality_filter = None):
         """Initialize with YouTube API key, optional quota tracker, and quality filter."""
         self.api_key = api_key
         self.youtube = build('youtube', 'v3', developerKey=api_key)
@@ -366,6 +367,16 @@ def save_to_csv(videos: List[Dict[str, Any]], output_path: str):
     return unique_path
 
 
+def create_quality_filter(filter_type: str, **kwargs):
+    """Create a quality filter instance based on the specified type."""
+    if filter_type == "yolo":
+        return VideoQualityFilter(**kwargs)
+    elif filter_type == "internvl3":
+        return VideoQualityFilterInternVL3(**kwargs)
+    else:
+        raise ValueError(f"Unknown filter type: {filter_type}. Choose 'yolo' or 'internvl3'.")
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description='PedX Crawler - Discover YouTube street-crossing videos by city')
@@ -379,9 +390,22 @@ def main():
     parser.add_argument('--use-multiple-search', action='store_true', help='Use multiple search terms per city (uses 5x more quota)')
     parser.add_argument('--quota-limit', type=int, default=10000, help='Daily quota limit (default: 10000)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
-    parser.add_argument('--enable-quality-filter', action='store_true', help='Enable two-stage quality filtering (Stage 1: metadata, Stage 2: YOLO)')
+    
+    # Quality filter arguments
+    parser.add_argument('--filter-type', choices=['yolo', 'internvl3'], default='yolo', 
+                       help='Choose quality filter type: yolo (YOLO11) or internvl3 (InternVL3)')
+    parser.add_argument('--enable-quality-filter', action='store_true', help='Enable quality filtering')
     parser.add_argument('--max-upload-months', type=int, default=36, help='Maximum age of videos in months for quality filter (default: 36)')
+    
+    # YOLO-specific arguments
     parser.add_argument('--yolo-model', default='yolo11n.pt', help='Path to YOLO11 model file (default: yolo11n.pt)')
+    
+    # InternVL3-specific arguments
+    parser.add_argument('--internvl3-model', default='OpenGVLab/InternVL3-8B', help='InternVL3 model name (default: OpenGVLab/InternVL3-8B)')
+    parser.add_argument('--threshold', type=float, default=0.9, help='Score threshold for InternVL3 filter (0.0-1.0, default: 0.9)')
+    parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda', 'mps'], help='Device for InternVL3 model (default: auto)')
+    
+    # Common arguments
     parser.add_argument('--temp-dir', default='tmp', help='Directory for temporary files (default: tmp)')
     
     args = parser.parse_args()
@@ -420,14 +444,23 @@ def main():
     quality_filter = None
     if args.enable_quality_filter:
         try:
-            quality_filter = VideoQualityFilter(
-                max_upload_months=args.max_upload_months,
-                yolo_model_path=args.yolo_model,
-                temp_dir=args.temp_dir
-            )
-            print("Quality filter initialized successfully")
+            # Prepare filter arguments based on filter type
+            filter_kwargs = {
+                'max_upload_months': args.max_upload_months,
+                'temp_dir': args.temp_dir
+            }
+            
+            if args.filter_type == "yolo":
+                filter_kwargs['yolo_model_path'] = args.yolo_model
+            elif args.filter_type == "internvl3":
+                filter_kwargs['model_name'] = args.internvl3_model
+                filter_kwargs['threshold'] = args.threshold
+                filter_kwargs['device'] = args.device
+            
+            quality_filter = create_quality_filter(args.filter_type, **filter_kwargs)
+            print(f"Quality filter ({args.filter_type}) initialized successfully")
         except Exception as e:
-            print(f"Warning: Could not initialize quality filter: {e}")
+            print(f"Warning: Could not initialize quality filter ({args.filter_type}): {e}")
             print("Continuing without quality filtering...")
     
     # Load cities
@@ -438,7 +471,9 @@ def main():
         print(f"Maximum {per_city} videos per city")
         print(f"Search mode: {'Multiple terms (5x quota)' if args.use_multiple_search else 'Single term (optimized)'}")
         print(f"Quota limit: {args.quota_limit:,} units")
-        print(f"Quality filter: {'Enabled' if quality_filter else 'Disabled'}")
+        print(f"Quality filter: {'Enabled (' + args.filter_type + ')' if quality_filter else 'Disabled'}")
+        if quality_filter and args.filter_type == "internvl3":
+            print(f"InternVL3 threshold: {args.threshold}")
         print(f"Estimated quota usage: {len(cities) * (500 if args.use_multiple_search else 100):,} units")
     
     # Initialize discovery tool

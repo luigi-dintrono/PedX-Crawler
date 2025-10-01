@@ -1,6 +1,6 @@
 # PedX Crawler - Road-Crossing Video Discovery Makefile
 
-.PHONY: help install setup run clean test run-filtered test-filtered clean-temp
+.PHONY: help install setup run clean test run-filtered test-filtered clean-temp run-yolo test-yolo run-internvl3 test-internvl3
 
 # Default target
 help:
@@ -12,6 +12,10 @@ help:
 	@echo "  run-filtered  - Run with quality filter enabled"
 	@echo "  test          - Test the script with a small sample"
 	@echo "  test-filtered - Test with quality filter (small sample)"
+	@echo "  run-yolo      - Run with YOLO quality filter"
+	@echo "  test-yolo     - Test with YOLO quality filter (small sample)"
+	@echo "  run-internvl3 - Run with InternVL3 quality filter"
+	@echo "  test-internvl3- Test with InternVL3 quality filter (small sample)"
 	@echo "  clean         - Clean output files"
 	@echo "  clean-temp    - Clean temporary files from quality filter"
 
@@ -67,3 +71,19 @@ clean-temp:
 # CI-friendly run (assumes API key is set via environment)
 ci-run:
 	python3 crawler/pedx-crawler.py --verbose
+
+# Run with YOLO quality filter
+run-yolo:
+	python3 crawler/pedx-crawler.py --filter-type yolo --enable-quality-filter --verbose --cities-file data/cities.txt
+
+# Test with YOLO quality filter (small sample)
+test-yolo:
+	python3 crawler/pedx-crawler.py --filter-type yolo --enable-quality-filter --verbose --per-city 3 --cities-file data/cities.txt
+
+# Run with InternVL3 quality filter
+run-internvl3:
+	python3 crawler/pedx-crawler.py --filter-type internvl3 --enable-quality-filter --verbose --cities-file data/cities.txt --device cpu --threshold 0.9
+
+# Test with InternVL3 quality filter (small sample)
+test-internvl3:
+	python3 crawler/pedx-crawler.py --filter-type internvl3 --enable-quality-filter --verbose --per-city 3 --cities-file data/cities.txt --device cpu --threshold 0.9
