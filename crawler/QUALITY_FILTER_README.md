@@ -28,7 +28,7 @@ The quality filter implements a two-stage approach with two different Stage 2 op
 ## Stage 1: Metadata Heuristic Filtering
 
 ### Quick Accepts (ALL must hold)
-- **Duration**: 10 seconds ≤ duration ≤ 20 minutes
+- **Duration**: 30 seconds ≤ duration ≤ 20 minutes (only enforced when the duration is known)
 - **Upload Date**: Within last N months (default: 36)
 - **Title Keywords**: Must contain any of:
   - "crosswalk"
@@ -36,7 +36,7 @@ The quality filter implements a two-stage approach with two different Stage 2 op
   - "pedestrian crossing"
   - "jaywalking"
   - "intersection"
-- **Video Type**: NOT a YouTube Short (reject vertical videos)
+- **Video Type**: NOT a YouTube Short (the video URL must not contain "shorts")
 
 ### Quick Rejects (ANY will reject)
 - **Title Keywords**: Contains any of:
@@ -44,9 +44,8 @@ The quality filter implements a two-stage approach with two different Stage 2 op
   - "fails"
   - "meme"
   - "try not to laugh"
-- **Video Type**: YouTube Shorts or vertical videos
-- **Duration**: Less than 30 seconds (stricter than accept lower bound)
-- **Channel Category**: Off-topic channels (optional)
+- **Video Type**: YouTube Shorts (URL contains "shorts")
+- **Duration**: Less than 30 seconds or more than 20 minutes
 
 ## Stage 2: Micro-clip Analysis
 
@@ -224,7 +223,7 @@ make run-internvl3    # Full run with InternVL3 filter
 #### YOLO-Specific Options
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--yolo-model PATH` | Path to YOLO11 model file | yolo11n.pt |
+| `--yolo-model PATH` | Path to an Ultralytics YOLO model file | yolo26n.pt |
 
 #### InternVL3-Specific Options
 | Option | Description | Default |
@@ -335,11 +334,11 @@ python3 pedx-crawler.py \
 
 #### YOLO Model Not Found
 ```
-Warning: Could not load YOLO model: [Errno 2] No such file or directory: 'yolo11n.pt'
+Warning: Could not load YOLO model: [Errno 2] No such file or directory: 'yolo26n.pt'
 ```
-**Solution**: The model will be downloaded automatically on first use, or download manually:
+**Solution**: The model is downloaded automatically on first use. To fetch it manually, use the latest Ultralytics assets release:
 ```bash
-wget https://github.com/ultralytics/assets/releases/download/v8.0.0/yolo11n.pt
+wget https://github.com/ultralytics/assets/releases/latest/download/yolo26n.pt
 ```
 
 #### InternVL3 Model Issues
@@ -376,7 +375,7 @@ sudo apt install ffmpeg
 #### Memory Issues
 **YOLO Filter**: Use smaller model or reduce batch size:
 ```bash
-python pedx-crawler.py --filter-type yolo --yolo-model yolo11n.pt --per-city 5
+python pedx-crawler.py --filter-type yolo --yolo-model yolo26n.pt --per-city 5
 ```
 
 **InternVL3 Filter**: Use CPU device or smaller model:

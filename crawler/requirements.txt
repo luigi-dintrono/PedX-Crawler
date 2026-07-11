@@ -9,7 +9,7 @@ requests>=2.34.2
 # --- Quality-filter dependencies (only needed with --enable-quality-filter) ---
 
 # YOLO filter (Stage 2A)
-ultralytics>=8.4.92        # provides YOLO11 (yolo11n.pt); >=8.3.0 is the minimum for YOLO11
+ultralytics>=8.4.92        # provides YOLO26 (yolo26n.pt, the default) and YOLO11 (yolo11n.pt); >=8.3.0 is the minimum for YOLO11
 numpy>=2.5.1               # requires Python >= 3.12
 yt-dlp>=2026.7.4           # also needs a system ffmpeg on PATH (see README)
 # opencv-python is no longer imported directly; ultralytics installs a compatible build.

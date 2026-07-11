@@ -138,17 +138,15 @@ The PedX Crawler includes an advanced two-stage quality filtering system to ensu
 ### Overview
 
 **Stage 1: Metadata Heuristic Filtering** (Fast)
-- Duration: 10 seconds - 20 minutes
+- Duration: 30 seconds - 20 minutes
 - Upload date: Within last N months (default: 36)
 - Title keywords: Must contain crosswalk, zebra crossing, pedestrian crossing, jaywalking, or intersection
-- Rejects: Compilations, fails, memes, shorts, and off-topic content
+- Rejects: Compilations, fails, memes, and YouTube Shorts
 
-**Stage 2: Micro-clip YOLO Analysis** (Thorough)
+**Stage 2: Micro-clip Analysis** (Thorough) — pick a backend with `--filter-type`
 - Downloads first 3 seconds of each video
-- Extracts 3 frames using ffmpeg
-- Runs Ultralytics YOLO object detection (YOLO26 by default)
-- Detects person + vehicle co-occurrence
-- Detects traffic lights + people/vehicles
+- **YOLO** (default, `--filter-type yolo`): extracts 3 frames, runs Ultralytics YOLO object detection (YOLO26 by default), and accepts on person + vehicle co-occurrence, multiple people, or traffic light + activity
+- **InternVL3** (`--filter-type internvl3`): extracts 1 frame and asks a vision-language model whether the clip is adequate for road-user-behavior analysis
 - Ensures videos show actual street crossing scenarios
 
 ### Smart Video Counting

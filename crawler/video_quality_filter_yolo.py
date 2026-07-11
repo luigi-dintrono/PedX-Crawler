@@ -313,9 +313,7 @@ class VideoQualityFilter:
             return 0.0
     
     def _extract_duration_seconds(self, video_data: Dict) -> Optional[int]:
-        """Extract video duration in seconds from video data."""
-        # This would need to be implemented based on how duration is stored
-        # in the video_data dictionary from the crawler
+        """Extract video duration in seconds from the crawler's 'end_time' field."""
         duration_str = video_data.get('end_time', '')
         if not duration_str:
             return None
