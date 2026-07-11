@@ -4,7 +4,7 @@ Video Quality Filter for PedX Crawler
 
 Implements a two-stage filtering system:
 - Stage 1: Metadata heuristic filtering using YouTube API data
-- Stage 2: Micro-clip analysis using YOLO11 object detection
+- Stage 2: Micro-clip analysis using Ultralytics YOLO object detection (YOLO26 by default)
 """
 
 import os
@@ -20,16 +20,18 @@ from ultralytics import YOLO
 class VideoQualityFilter:
     """Two-stage video quality filter for street crossing videos."""
     
-    def __init__(self, 
+    def __init__(self,
                  max_upload_months: int = 36,
-                 yolo_model_path: str = "yolo11n.pt",
+                 yolo_model_path: str = "yolo26n.pt",
                  temp_dir: str = "tmp"):
         """
         Initialize the video quality filter.
-        
+
         Args:
             max_upload_months: Maximum age of videos in months
-            yolo_model_path: Path to YOLO11 model file
+            yolo_model_path: Path to an Ultralytics YOLO model file (default: yolo26n.pt).
+                Any Ultralytics YOLO checkpoint works; the COCO class IDs used for
+                scoring are identical across YOLO11/YOLO26.
             temp_dir: Directory for temporary files
         """
         self.max_upload_months = max_upload_months
@@ -126,7 +128,7 @@ class VideoQualityFilter:
         return True, "Passed Stage 1 metadata checks"
     
     def _stage2_micro_clip_filter(self, video_data: Dict) -> Tuple[bool, str]:
-        """Stage 2: Micro-clip analysis with YOLO11."""
+        """Stage 2: Micro-clip analysis with the Ultralytics YOLO model."""
         if not self.yolo_model:
             return True, "YOLO model not available, skipping Stage 2"
         
@@ -248,7 +250,7 @@ class VideoQualityFilter:
         return frame_paths
     
     def _analyze_frame_with_yolo(self, frame_path: str) -> float:
-        """Analyze a single frame with YOLO11 and return score."""
+        """Analyze a single frame with the YOLO model and return score."""
         try:
             # Run YOLO inference
             results = self.yolo_model(frame_path)

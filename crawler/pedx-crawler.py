@@ -410,12 +410,12 @@ def main():
     
     # Quality filter arguments
     parser.add_argument('--filter-type', choices=['yolo', 'internvl3'], default='yolo', 
-                       help='Choose quality filter type: yolo (YOLO11) or internvl3 (InternVL3)')
+                       help='Choose quality filter type: yolo (YOLO26) or internvl3 (InternVL3)')
     parser.add_argument('--enable-quality-filter', action='store_true', help='Enable quality filtering')
     parser.add_argument('--max-upload-months', type=int, default=36, help='Maximum age of videos in months for quality filter (default: 36)')
     
     # YOLO-specific arguments
-    parser.add_argument('--yolo-model', default='yolo11n.pt', help='Path to YOLO11 model file (default: yolo11n.pt)')
+    parser.add_argument('--yolo-model', default='yolo26n.pt', help='Path to an Ultralytics YOLO model file (default: yolo26n.pt)')
     
     # InternVL3-specific arguments
     parser.add_argument('--internvl3-model', default='OpenGVLab/InternVL3-8B', help='InternVL3 model name (default: OpenGVLab/InternVL3-8B)')

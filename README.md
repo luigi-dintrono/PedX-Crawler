@@ -146,7 +146,7 @@ The PedX Crawler includes an advanced two-stage quality filtering system to ensu
 **Stage 2: Micro-clip YOLO Analysis** (Thorough)
 - Downloads first 3 seconds of each video
 - Extracts 3 frames using ffmpeg
-- Runs YOLO11 object detection
+- Runs Ultralytics YOLO object detection (YOLO26 by default)
 - Detects person + vehicle co-occurrence
 - Detects traffic lights + people/vehicles
 - Ensures videos show actual street crossing scenarios
@@ -245,7 +245,7 @@ Request quota increases in [Google Cloud Console](https://console.cloud.google.c
 
 ### Quality Filter Dependencies (Optional)
 These are only imported when `--enable-quality-filter` is used:
-- `ultralytics` - YOLO11 object detection (also provides numpy/opencv transitively)
+- `ultralytics` - YOLO object detection, YOLO26 by default (also provides numpy/opencv transitively)
 - `numpy` - Numerical operations
 - `yt-dlp` - YouTube video downloading
 - `ffmpeg` - Video processing (system dependency)
@@ -282,7 +282,7 @@ The script includes error handling for rate limits and API errors.
 .
 ├── crawler/
 │   ├── pedx-crawler.py                    # Main PedX crawler script
-│   ├── video_quality_filter_yolo.py      # YOLO11 quality filter (Stage 2A)
+│   ├── video_quality_filter_yolo.py      # YOLO quality filter, YOLO26 default (Stage 2A)
 │   ├── video_quality_filter_internvl3.py # InternVL3 quality filter (Stage 2B)
 │   ├── legacy/                            # Archived earlier version
 │   ├── requirements.txt                  # Python dependencies

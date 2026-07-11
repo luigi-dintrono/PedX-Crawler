@@ -6,13 +6,13 @@ This document describes the two-stage video quality filtering system integrated 
 
 The quality filter implements a two-stage approach with two different Stage 2 options:
 - **Stage 1**: Fast metadata-based filtering using YouTube API data (same for both filters)
-- **Stage 2A**: Micro-clip analysis using YOLO11 object detection (fast, rule-based)
+- **Stage 2A**: Micro-clip analysis using Ultralytics YOLO object detection — YOLO26 by default (fast, rule-based)
 - **Stage 2B**: Micro-clip analysis using InternVL3 vision-language model (sophisticated, AI-powered)
 
 ## Filter Types
 
 ### YOLO Filter (Default)
-- **Analysis Type**: Object detection using YOLO11
+- **Analysis Type**: Object detection using Ultralytics YOLO (YOLO26 by default)
 - **Speed**: Fast (~2-5 seconds per video)
 - **Memory**: Low requirements
 - **Accuracy**: Good for detecting objects and basic scene understanding
@@ -53,10 +53,13 @@ The quality filter implements a two-stage approach with two different Stage 2 op
 Both filters download a micro-clip, extract frames, then score them:
 1. **Download Micro-clip**: Download first 3 seconds using yt-dlp
 2. **Extract Frames**: YOLO extracts 3 frames (at 0s, 1s, 2s); InternVL3 extracts 1 frame (at 1.5s) using ffmpeg
-3. **Analysis**: Apply either YOLO11 object detection or InternVL3 vision-language analysis
+3. **Analysis**: Apply either YOLO object detection or InternVL3 vision-language analysis
 4. **Scoring**: Convert analysis results to numerical scores
 
-### YOLO11 Object Detection
+### YOLO Object Detection (YOLO26 by default)
+
+The COCO class IDs below are identical across YOLO11 and YOLO26, so the scoring
+rules are unchanged when you switch models.
 
 #### Object Detection Classes
 - `person` (class 0)
@@ -127,7 +130,7 @@ Versions below reflect the pins in `requirements.txt` (current as of July 2026).
 - `ffmpeg` - Video processing (system dependency)
 
 #### YOLO Filter Dependencies
-- `ultralytics>=8.4.92` - YOLO11 model (minimum `8.3.0` for YOLO11; also installs opencv/numpy transitively)
+- `ultralytics>=8.4.92` - YOLO models; provides YOLO26 (default `yolo26n.pt`) and YOLO11 (minimum `8.3.0` for YOLO11); also installs opencv/numpy transitively
 
 #### InternVL3 Filter Dependencies
 - `torch>=2.13.0` - PyTorch for deep learning
@@ -163,7 +166,7 @@ python pedx-crawler.py \
   --enable-quality-filter \
   --filter-type yolo \
   --max-upload-months 36 \
-  --yolo-model yolo11n.pt \
+  --yolo-model yolo26n.pt \
   --temp-dir tmp \
   --verbose
 ```
