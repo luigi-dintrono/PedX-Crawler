@@ -8,18 +8,15 @@ Implements a two-stage filtering system:
 """
 
 import os
-import re
+import sys
 import subprocess
-import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 # Fix tokenizers parallelism warning when using subprocess
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import cv2
-import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 from PIL import Image
@@ -50,32 +47,40 @@ class VideoQualityFilterInternVL3:
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(exist_ok=True)
         self.threshold = threshold
-        
+
+        # Resolve the target device BEFORE loading the model so the model weights
+        # and the input tensors are always derived from the SAME device. (The
+        # previous code chose the weight dtype from the raw 'device' arg but the
+        # input dtype from the resolved device, so '--device auto' on a CPU-only
+        # machine loaded bfloat16 weights yet fed float32 inputs -> dtype-mismatch
+        # crash that silently rejected every video.)
+        if device == "auto":
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
+
+        # bfloat16 on accelerators, float32 on CPU. Stored so frame
+        # preprocessing can cast inputs to the exact same dtype as the weights.
+        self.model_dtype = torch.bfloat16 if self.device != 'cpu' else torch.float32
+
         # Initialize InternVL3 model
         try:
             print("Loading InternVL3 model...")
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             self.model = AutoModel.from_pretrained(
-                model_name, 
-                torch_dtype=torch.bfloat16 if device != 'cpu' else torch.float32,
+                model_name,
+                torch_dtype=self.model_dtype,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True
             ).eval()
-            
-            # Set device
-            if device == "auto":
-                if torch.cuda.is_available():
-                    self.device = "cuda"
-                elif torch.backends.mps.is_available():
-                    self.device = "mps"
-                else:
-                    self.device = "cpu"
-            else:
-                self.device = device
-                
             self.model = self.model.to(self.device)
             print(f"InternVL3 model loaded on {self.device}")
-            
+
         except Exception as e:
             print(f"Warning: Could not load InternVL3 model: {e}")
             self.model = None
@@ -150,12 +155,7 @@ class VideoQualityFilterInternVL3:
         has_positive_keyword = any(keyword in title for keyword in self.positive_keywords)
         if not has_positive_keyword:
             return False, "No positive keywords found in title"
-        
-        # Check duration range (if available)
-        if duration is not None:
-            if not (10 <= duration <= 1200):  # 10s to 20min
-                return False, f"Duration outside acceptable range: {duration}s"
-        
+
         return True, "Passed Stage 1 metadata checks"
     
     def _stage2_internvl3_filter(self, video_data: Dict) -> Tuple[bool, str]:
@@ -169,111 +169,82 @@ class VideoQualityFilterInternVL3:
         if not video_id or not video_url:
             return False, "Missing video ID or URL"
         
+        clip_path = None
+        frame_paths = []
         try:
             # Download micro-clip (0-3 seconds)
             clip_path = self._download_micro_clip(video_id, video_url)
             if not clip_path:
                 return False, "Failed to download micro-clip"
-            
+
             # Extract only 1 frame (from middle of clip for best representation)
             frame_paths = self._extract_frames(clip_path, video_id)
             if not frame_paths:
                 return False, "Failed to extract frames"
-            
+
             # Analyze the single frame with InternVL3
             print(f"    Analyzing 1 frame with InternVL3...")
             video_score = self._analyze_frame_with_internvl3(frame_paths[0])
-            
-            # Clean up temporary files
-            self._cleanup_temp_files(clip_path, frame_paths)
-            
+
             # Decision: accept if frame meets threshold
             if video_score >= self.threshold:
                 return True, f"Stage 2 passed with score: {video_score:.3f} (threshold: {self.threshold})"
             else:
                 return False, f"Stage 2 failed with score: {video_score:.3f} (threshold: {self.threshold})"
-                
+
         except Exception as e:
             return False, f"Stage 2 error: {str(e)}"
+        finally:
+            # Always clean up the downloaded clip and any extracted frames,
+            # including on the early-return / error paths.
+            if clip_path:
+                self._cleanup_temp_files(clip_path, frame_paths)
     
     def _download_micro_clip(self, video_id: str, video_url: str) -> Optional[str]:
         """Download first 3 seconds of video using yt-dlp."""
         output_path = self.temp_dir / f"{video_id}.mp4"
-        
-        try:
-            # Try system yt-dlp first with robust format selector
-            # Use format selector that works better with new YouTube restrictions
-            cmd = [
-                'yt-dlp',
-                '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
-                '--download-sections', '*0-3',
-                '--max-filesize', '10M',  # Increased from 4M for better success rate
-                '--no-check-certificate',
-                '--extractor-args', 'youtube:player_client=android',  # Use android client to bypass SABR
-                '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36',
-                '--merge-output-format', 'mp4',
-                '-o', str(output_path),
-                video_url
-            ]
-            
+
+        # Shared yt-dlp arguments. The format selector and android client work
+        # better with newer YouTube restrictions (SABR).
+        ytdlp_args = [
+            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
+            '--download-sections', '*0-3',
+            '--max-filesize', '10M',
+            '--extractor-args', 'youtube:player_client=android',
+            '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36',
+            '--merge-output-format', 'mp4',
+            '-o', str(output_path),
+            video_url,
+        ]
+
+        # Try the system yt-dlp executable first, then fall back to running the
+        # yt_dlp module with the current interpreter. Using sys.executable makes
+        # the fallback work on every platform (on Windows 'python3' is often
+        # absent or a Microsoft Store stub).
+        commands = [
+            ['yt-dlp'] + ytdlp_args,
+            [sys.executable, '-m', 'yt_dlp'] + ytdlp_args,
+        ]
+
+        for i, cmd in enumerate(commands):
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                
                 if result.returncode == 0 and output_path.exists():
                     return str(output_path)
-                else:
-                    # Fallback to Python module
-                    print(f"System yt-dlp failed, trying Python module for {video_id}")
-                    cmd = [
-                        'python3', '-m', 'yt_dlp',
-                        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
-                        '--download-sections', '*0-3',
-                        '--max-filesize', '10M',
-                        '--no-check-certificate',
-                        '--extractor-args', 'youtube:player_client=android',
-                        '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36',
-                        '--merge-output-format', 'mp4',
-                        '-o', str(output_path),
-                        video_url
-                    ]
-                    
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                    
-                    if result.returncode == 0 and output_path.exists():
-                        return str(output_path)
-                    else:
-                        print(f"yt-dlp failed for {video_id}: {result.stderr}")
-                        return None
-            except FileNotFoundError:
-                # System yt-dlp not found, try Python module directly
-                print(f"System yt-dlp not found, trying Python module for {video_id}")
-                cmd = [
-                    'python3', '-m', 'yt_dlp',
-                    '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
-                    '--download-sections', '*0-3',
-                    '--max-filesize', '10M',
-                    '--no-check-certificate',
-                    '--extractor-args', 'youtube:player_client=android',
-                    '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36',
-                    '--merge-output-format', 'mp4',
-                    '-o', str(output_path),
-                    video_url
-                ]
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                
-                if result.returncode == 0 and output_path.exists():
-                    return str(output_path)
-                else:
+                if i == len(commands) - 1:
                     print(f"yt-dlp failed for {video_id}: {result.stderr}")
-                    return None
-                
-        except subprocess.TimeoutExpired:
-            print(f"yt-dlp timeout for {video_id}")
-            return None
-        except Exception as e:
-            print(f"Error downloading {video_id}: {e}")
-            return None
+            except FileNotFoundError:
+                # This launcher isn't available; try the next fallback.
+                print(f"'{cmd[0]}' not found, trying next fallback for {video_id}")
+                continue
+            except subprocess.TimeoutExpired:
+                print(f"yt-dlp timeout for {video_id}")
+                return None
+            except Exception as e:
+                print(f"Error downloading {video_id}: {e}")
+                return None
+
+        return None
     
     def _extract_frames(self, video_path: str, video_id: str) -> List[str]:
         """Extract 1 frame from middle of video (1.5 seconds) using ffmpeg."""
@@ -312,7 +283,7 @@ class VideoQualityFilterInternVL3:
             
             print(f"      [InternVL3] Loading image: {os.path.basename(frame_path)}")
             # Load image with fewer tiles for faster processing on CPU
-            pixel_values = self._load_image(frame_path, max_num=1).to(self.device, dtype=torch.bfloat16 if self.device != 'cpu' else torch.float32)
+            pixel_values = self._load_image(frame_path, max_num=1).to(self.device, dtype=self.model_dtype)
             
             print(f"      [InternVL3] Running inference (expect 30-90s on CPU)...")
             # Use the model's chat method with proper parameters
@@ -331,7 +302,7 @@ class VideoQualityFilterInternVL3:
             )
             
             elapsed = time.time() - start_time
-            print(f"      [InternVL3] ✓ Completed in {elapsed:.1f}s - Response: '{response}'")
+            print(f"      [InternVL3] Completed in {elapsed:.1f}s - Response: '{response}'")
             
             response = response.strip().lower()
             
@@ -458,11 +429,15 @@ class VideoQualityFilterInternVL3:
             return None
     
     def _extract_upload_date(self, video_data: Dict) -> Optional[datetime]:
-        """Extract upload date from video data (same as YOLO version)."""
-        # This would need to be implemented based on how upload date is stored
-        # in the video_data dictionary from the crawler
-        # For now, return None (not available in current crawler)
-        return None
+        """Extract upload date from the crawler's 'published_at' field."""
+        published_at = video_data.get('published_at', '')
+        if not published_at:
+            return None
+        try:
+            # YouTube publishedAt is ISO 8601 UTC, e.g. "2024-05-01T12:00:00Z".
+            return datetime.strptime(published_at, '%Y-%m-%dT%H:%M:%SZ')
+        except (ValueError, TypeError):
+            return None
     
     def _cleanup_temp_files(self, clip_path: str, frame_paths: List[str]):
         """Clean up temporary files (same as YOLO version)."""

@@ -7,22 +7,20 @@ compatible with the PedX pipeline.
 """
 
 import os
+import re
 import sys
 import csv
 import argparse
-import ssl
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from pathlib import Path
 
-import requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 
-# Import the quality filters
-from video_quality_filter_yolo import VideoQualityFilter
-from video_quality_filter_internvl3 import VideoQualityFilterInternVL3
+# The quality filters are imported lazily inside create_quality_filter() so the
+# heavy ML dependencies (torch, ultralytics, transformers, ...) are only needed
+# when quality filtering is actually enabled.
 
 
 class QuotaTracker:
@@ -48,6 +46,8 @@ class QuotaTracker:
     
     def get_quota_percentage(self) -> float:
         """Get quota usage percentage."""
+        if self.daily_limit <= 0:
+            return 0.0
         return (self.used_quota / self.daily_limit) * 100
     
     def can_make_search_request(self) -> bool:
@@ -70,10 +70,7 @@ class YouTubeDiscovery:
         self.youtube = build('youtube', 'v3', developerKey=api_key)
         self.quota_tracker = quota_tracker or QuotaTracker()
         self.quality_filter = quality_filter
-        
-        # Fix SSL issues on macOS
-        ssl._create_default_https_context = ssl._create_unverified_context
-    
+
     def search_videos(self, city: str, max_results: int = 50, since_date: str = '2020-01-01T00:00:00Z', use_single_search: bool = True) -> List[Dict[str, Any]]:
         """
         Search for street-crossing videos in a specific city.
@@ -105,22 +102,24 @@ class YouTubeDiscovery:
         quality_videos = []
         seen_ids = set()
         search_term_index = 0
+        exhausted_terms = set()  # indices of search terms with no more pages
         next_page_token = None
         max_search_attempts = 10  # Prevent infinite loops
         search_attempts = 0
-        
+
         print(f"  Searching for {max_results} quality videos in {city}...")
-        
+
         while len(quality_videos) < max_results and search_attempts < max_search_attempts:
             # Check quota before making request
             if not self.quota_tracker.can_make_search_request():
                 print(f"  QUOTA WARNING: Not enough quota to continue searching. {self.quota_tracker.get_status()}")
                 break
-            
+
             # Get current search term
-            search_term = search_terms[search_term_index % len(search_terms)]
+            current_idx = search_term_index % len(search_terms)
+            search_term = search_terms[current_idx]
             search_attempts += 1
-            
+
             try:
                 # Search for videos with pagination
                 search_params = {
@@ -131,90 +130,103 @@ class YouTubeDiscovery:
                     'order': 'relevance',
                     'publishedAfter': since_date
                 }
-                
+
                 if next_page_token:
                     search_params['pageToken'] = next_page_token
-                
+
                 search_response = self.youtube.search().list(**search_params).execute()
-                
+
                 # Track quota usage
                 self.quota_tracker.add_search_request()
-                
+
                 # Process videos from this batch
-                videos_processed = 0
                 for item in search_response.get('items', []):
                     if len(quality_videos) >= max_results:
                         break
-                        
-                    video_id = item['id']['videoId']
-                    
+
+                    # Guard against malformed items so one bad entry does not
+                    # abort the rest of the batch.
+                    try:
+                        video_id = item['id']['videoId']
+                        snippet = item['snippet']
+                    except (KeyError, TypeError):
+                        continue
+
                     # Skip if we've already seen this video
                     if video_id in seen_ids:
                         continue
-                    
+
                     seen_ids.add(video_id)
-                    snippet = item['snippet']
-                    
+                    title = snippet.get('title', '')
+
                     # Get additional video details
                     video_details = self._get_video_details(video_id)
                     if video_details:
                         self.quota_tracker.add_video_details_request()
                         video_data = {
                             'id': video_id,
-                            'name': snippet['title'],
+                            'name': title,
                             'city': city,
                             'video': video_id,
                             'video_url': f"https://www.youtube.com/watch?v={video_id}",
-                            'time_of_day': self._extract_time_of_day(snippet['title']),
+                            'time_of_day': self._extract_time_of_day(title),
                             'start_time': '0:00',  # Default start time
                             'end_time': self._extract_duration(video_details),
                             'region_code': self._extract_region_code(city),
-                            'channel_name': snippet['channelTitle'],
-                            'channel_url': f"https://www.youtube.com/channel/{snippet['channelId']}"
+                            'channel_name': snippet.get('channelTitle', ''),
+                            'channel_url': f"https://www.youtube.com/channel/{snippet.get('channelId', '')}",
+                            # Helper field for the quality filter's upload-date check;
+                            # dropped from the CSV output (see save_to_csv).
+                            'published_at': snippet.get('publishedAt', '')
                         }
-                        
+
                         # Apply quality filter if available
                         if self.quality_filter:
                             is_quality, filter_reason = self.quality_filter.filter_video(video_data)
                             if not is_quality:
-                                print(f"    Filtered out: '{snippet['title'][:50]}...' - {filter_reason}")
+                                print(f"    Filtered out: '{title[:50]}...' - {filter_reason}")
                                 continue
                             else:
-                                print(f"    ✓ Quality video: '{snippet['title'][:50]}...'")
+                                print(f"    [OK] Quality video: '{title[:50]}...'")
                         else:
-                            print(f"    ✓ Video added: '{snippet['title'][:50]}...'")
-                        
+                            print(f"    [OK] Video added: '{title[:50]}...'")
+
                         quality_videos.append(video_data)
-                        videos_processed += 1
-                
-                # Check if we have more pages for this search term
+
+                # Advance pagination / search term.
                 next_page_token = search_response.get('nextPageToken')
                 if not next_page_token:
-                    # No more pages for this search term, move to next term
-                    search_term_index += 1
-                    next_page_token = None
+                    # This search term is fully paginated; move on to the next one.
                     print(f"  Completed search term: '{search_term}' - Found {len(quality_videos)} quality videos so far")
-                
-                # If we processed no videos in this batch, try next search term
-                if videos_processed == 0 and not next_page_token:
+                    exhausted_terms.add(current_idx)
                     search_term_index += 1
-                    next_page_token = None
-                
+                    # Stop once every term has been drained, instead of wrapping
+                    # around and re-crawling page 1 of an exhausted term (wasted quota).
+                    if len(exhausted_terms) >= len(search_terms):
+                        print(f"  All search terms exhausted for {city}")
+                        break
+
             except HttpError as e:
                 if "quotaExceeded" in str(e):
                     print(f"  QUOTA EXCEEDED: Cannot search for '{search_term}'. Please wait 24 hours or request quota increase.")
                     raise e  # Re-raise to stop processing
                 else:
                     print(f"  Error searching for '{search_term}': {e}")
+                    exhausted_terms.add(current_idx)
                     search_term_index += 1
                     next_page_token = None
+                    if len(exhausted_terms) >= len(search_terms):
+                        break
                     continue
             except Exception as e:
                 print(f"  Unexpected error searching for '{search_term}': {e}")
+                exhausted_terms.add(current_idx)
                 search_term_index += 1
                 next_page_token = None
+                if len(exhausted_terms) >= len(search_terms):
+                    break
                 continue
-        
+
         print(f"  Search complete: Found {len(quality_videos)} quality videos out of {len(seen_ids)} total videos processed")
         return quality_videos[:max_results]
     
@@ -249,24 +261,18 @@ class YouTubeDiscovery:
             return 'unknown'
     
     def _extract_duration(self, video_details: Dict[str, Any]) -> str:
-        """Extract duration from video details."""
+        """Extract duration from video details (ISO 8601 -> H:MM:SS)."""
         duration = video_details.get('contentDetails', {}).get('duration', 'PT0S')
-        # Convert ISO 8601 duration to readable format
-        # This is a simplified conversion - in production you'd want a proper parser
-        if duration.startswith('PT'):
-            duration = duration[2:]
-            if 'H' in duration:
-                hours = duration.split('H')[0]
-                minutes = duration.split('H')[1].split('M')[0] if 'M' in duration else '0'
-                return f"{hours}:{minutes.zfill(2)}:00"
-            elif 'M' in duration:
-                minutes = duration.split('M')[0]
-                seconds = duration.split('M')[1].split('S')[0] if 'S' in duration else '0'
-                return f"0:{minutes.zfill(2)}:{seconds.zfill(2)}"
-            else:
-                seconds = duration.split('S')[0]
-                return f"0:00:{seconds.zfill(2)}"
-        return '0:00:00'
+        # Parse the hours/minutes/seconds components independently so none is
+        # dropped (the previous split-based approach zeroed seconds for videos
+        # containing an hours component).
+        match = re.fullmatch(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration or '')
+        if not match:
+            return '0:00:00'
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
     
     def _extract_region_code(self, city: str) -> str:
         """Extract region code from city name."""
@@ -353,14 +359,19 @@ def save_to_csv(videos: List[Dict[str, Any]], output_path: str):
         'start_time', 'end_time', 'region_code', 'channel_name', 'channel_url'
     ]
     
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+    # Ensure output directory exists (skip when --output is a bare filename,
+    # where os.path.dirname returns '' and os.makedirs('') would raise).
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
     # Get unique filename to avoid overwriting existing files
     unique_path = get_unique_filename(output_path)
-    
+
     with open(unique_path, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        # extrasaction='ignore' drops helper fields (e.g. published_at) that the
+        # quality filter uses but that are not part of the CSV schema.
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(videos)
     
@@ -368,10 +379,16 @@ def save_to_csv(videos: List[Dict[str, Any]], output_path: str):
 
 
 def create_quality_filter(filter_type: str, **kwargs):
-    """Create a quality filter instance based on the specified type."""
+    """Create a quality filter instance based on the specified type.
+
+    Imports are performed lazily so the crawler can run with only the core
+    dependencies installed when quality filtering is not requested.
+    """
     if filter_type == "yolo":
+        from video_quality_filter_yolo import VideoQualityFilter
         return VideoQualityFilter(**kwargs)
     elif filter_type == "internvl3":
+        from video_quality_filter_internvl3 import VideoQualityFilterInternVL3
         return VideoQualityFilterInternVL3(**kwargs)
     else:
         raise ValueError(f"Unknown filter type: {filter_type}. Choose 'yolo' or 'internvl3'.")
@@ -384,8 +401,8 @@ def main():
     parser.add_argument('--api-key-file', help='Path to file containing YouTube API key')
     parser.add_argument('--cities-file', default='data/cities.txt', help='Path to cities file')
     parser.add_argument('--output', default='data/outputs/discovery.csv', help='Output CSV file path')
-    parser.add_argument('--max-results', type=int, default=50, help='Maximum results per city (deprecated, use --per-city)')
-    parser.add_argument('--per-city', type=int, default=50, help='Maximum quality videos per city (continues searching until target reached)')
+    parser.add_argument('--max-results', type=int, default=None, help='Maximum results per city (deprecated, use --per-city)')
+    parser.add_argument('--per-city', type=int, default=None, help='Maximum quality videos per city (continues searching until target reached)')
     parser.add_argument('--since', default='2020-01-01', help='Filter videos published after this date (YYYY-MM-DD format)')
     parser.add_argument('--use-multiple-search', action='store_true', help='Use multiple search terms per city (uses 5x more quota)')
     parser.add_argument('--quota-limit', type=int, default=10000, help='Daily quota limit (default: 10000)')
@@ -434,8 +451,15 @@ def main():
     # Convert date format
     since_date_iso = convert_date_to_iso(args.since)
     
-    # Determine per-city limit (prefer --per-city over --max-results)
-    per_city = args.per_city if args.per_city != 50 or args.max_results == 50 else args.max_results
+    # Determine per-city limit: an explicit --per-city always wins, then the
+    # deprecated --max-results, otherwise the default of 50. (Using None
+    # defaults lets us distinguish an explicit value from the default.)
+    if args.per_city is not None:
+        per_city = args.per_city
+    elif args.max_results is not None:
+        per_city = args.max_results
+    else:
+        per_city = 50
     
     # Initialize quota tracker
     quota_tracker = QuotaTracker(daily_limit=args.quota_limit)
@@ -474,7 +498,8 @@ def main():
         print(f"Quality filter: {'Enabled (' + args.filter_type + ')' if quality_filter else 'Disabled'}")
         if quality_filter and args.filter_type == "internvl3":
             print(f"InternVL3 threshold: {args.threshold}")
-        print(f"Estimated quota usage: {len(cities) * (500 if args.use_multiple_search else 100):,} units")
+        print(f"Estimated minimum quota usage: {len(cities) * (500 if args.use_multiple_search else 100):,} units "
+              f"(excludes pagination retries and per-video detail lookups)")
     
     # Initialize discovery tool
     discovery = YouTubeDiscovery(api_key, quota_tracker, quality_filter)

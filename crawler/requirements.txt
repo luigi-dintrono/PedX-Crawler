@@ -1,15 +1,25 @@
-google-api-python-client==2.108.0
-python-dotenv==1.0.0
-requests==2.31.0
-ultralytics==8.0.196
-opencv-python==4.8.1.78
-numpy==1.24.3
-yt-dlp==2025.9.5
-# InternVL3 dependencies
-torch>=2.0.0
-torchvision>=0.15.0
-transformers>=4.35.0
-Pillow>=9.0.0
-accelerate>=0.20.0
-einops>=0.8.0
-timm>=1.0.0
+# Versions current as of July 2026. Floors are set to the latest release so a
+# fresh install pulls the newest compatible build.
+
+# --- Core crawler dependencies (always required) ---
+google-api-python-client>=2.198.0
+python-dotenv>=1.2.2
+requests>=2.34.2
+
+# --- Quality-filter dependencies (only needed with --enable-quality-filter) ---
+
+# YOLO filter (Stage 2A)
+ultralytics>=8.4.92        # provides YOLO11 (yolo11n.pt); >=8.3.0 is the minimum for YOLO11
+numpy>=2.5.1               # requires Python >= 3.12
+yt-dlp>=2026.7.4           # also needs a system ffmpeg on PATH (see README)
+# opencv-python is no longer imported directly; ultralytics installs a compatible build.
+
+# InternVL3 filter (Stage 2B)
+torch>=2.13.0
+torchvision>=0.28.0
+transformers>=5.13.1       # NOTE: InternVL3 relies on trust_remote_code; validate its
+                           # custom modeling code against transformers 5.x before a full run.
+Pillow>=12.3.0
+accelerate>=1.14.0
+einops>=0.8.2
+timm>=1.0.27

@@ -50,9 +50,9 @@ The quality filter implements a two-stage approach with two different Stage 2 op
 
 ## Stage 2: Micro-clip Analysis
 
-Both filters follow the same process for micro-clip analysis:
+Both filters download a micro-clip, extract frames, then score them:
 1. **Download Micro-clip**: Download first 3 seconds using yt-dlp
-2. **Extract Frames**: Extract 3 frames using ffmpeg
+2. **Extract Frames**: YOLO extracts 3 frames (at 0s, 1s, 2s); InternVL3 extracts 1 frame (at 1.5s) using ffmpeg
 3. **Analysis**: Apply either YOLO11 object detection or InternVL3 vision-language analysis
 4. **Scoring**: Convert analysis results to numerical scores
 
@@ -83,12 +83,16 @@ Both filters follow the same process for micro-clip analysis:
 ### InternVL3 Vision-Language Analysis
 
 #### Analysis Process
-1. **Frame Analysis**: Each frame is analyzed with InternVL3 using the prompt:
+1. **Frame Analysis**: A single frame (at 1.5s) is analyzed with InternVL3 using the prompt:
    ```
    "For the analysis of road user behavior, is this video adequate? Be strict. Only answer yes or no. Answer in a single word."
    ```
 2. **Response Processing**: Converts "yes"/"no" responses to 1.0/0.0 scores
-3. **Threshold Decision**: Accepts videos with max frame score ≥ threshold (default: 0.9)
+3. **Threshold Decision**: Accepts the video when the frame score ≥ threshold (default: 0.9)
+
+> **Note:** the score is binary (1.0 for "yes", 0.0 for "no"), so any threshold in
+> `(0.0, 1.0]` behaves identically. A threshold of `0.0` accepts every video (it
+> would pass even a "no"), so keep the threshold above 0.
 
 #### Advantages over YOLO
 - **Context Understanding**: Better understanding of scene composition and context
@@ -115,22 +119,24 @@ sudo apt install ffmpeg
 
 ### Dependencies
 
+Versions below reflect the pins in `requirements.txt` (current as of July 2026).
+
 #### Core Dependencies (Both Filters)
-- `opencv-python==4.8.1.78` - Image processing
-- `numpy==1.24.3` - Numerical operations
-- `yt-dlp==2025.9.5` - YouTube video downloading
+- `numpy>=2.5.1` - Numerical operations (requires Python 3.12+)
+- `yt-dlp>=2026.7.4` - YouTube video downloading
 - `ffmpeg` - Video processing (system dependency)
 
 #### YOLO Filter Dependencies
-- `ultralytics==8.0.196` - YOLO11 model
+- `ultralytics>=8.4.92` - YOLO11 model (minimum `8.3.0` for YOLO11; also installs opencv/numpy transitively)
 
 #### InternVL3 Filter Dependencies
-- `torch>=2.0.0` - PyTorch for deep learning
-- `transformers>=4.35.0` - HuggingFace transformers
-- `Pillow>=9.0.0` - Image processing
-- `accelerate>=0.20.0` - Model acceleration
-- `einops>=0.8.0` - Tensor operations
-- `timm>=1.0.0` - Vision models
+- `torch>=2.13.0` - PyTorch for deep learning
+- `torchvision>=0.28.0` - Image transforms (required by the InternVL3 preprocessing)
+- `transformers>=5.13.1` - HuggingFace transformers (validate InternVL3 `trust_remote_code` on 5.x)
+- `Pillow>=12.3.0` - Image processing
+- `accelerate>=1.14.0` - Model acceleration
+- `einops>=0.8.2` - Tensor operations
+- `timm>=1.0.27` - Vision models
 
 ## Usage
 

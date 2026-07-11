@@ -8,7 +8,6 @@ A minimal, production-lean MVP that discovers YouTube street-crossing videos by 
 - 🎯 **Two-stage quality filtering** - Ensures only high-quality videos are added to CSV
 - 📊 Outputs CSV with columns: `id`, `name`, `city`, `video`, `video_url`, `time_of_day`, `start_time`, `end_time`, `region_code`, `channel_name`, `channel_url`
 - 🔐 Secure API key handling (supports `.env` and `--api-key-file`)
-- 🍎 macOS SSL issue fixes included
 - 🚀 Easy local and CI execution via Makefile
 - ⚡ Quota-optimized search (5x more cities with same API quota)
 - 📈 Real-time quota monitoring and management
@@ -233,7 +232,7 @@ Request quota increases in [Google Cloud Console](https://console.cloud.google.c
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.10+ for the core crawler (Python 3.12+ when using the quality filters — numpy 2.5+ requires 3.12)
 - YouTube Data API v3 key
 - Internet connection
 
@@ -245,16 +244,20 @@ Request quota increases in [Google Cloud Console](https://console.cloud.google.c
 - `requests` - HTTP requests
 
 ### Quality Filter Dependencies (Optional)
-- `ultralytics` - YOLO11 object detection
-- `opencv-python` - Image processing
+These are only imported when `--enable-quality-filter` is used:
+- `ultralytics` - YOLO11 object detection (also provides numpy/opencv transitively)
 - `numpy` - Numerical operations
 - `yt-dlp` - YouTube video downloading
 - `ffmpeg` - Video processing (system dependency)
+- `torch`, `torchvision`, `transformers`, `Pillow`, `accelerate`, `einops`, `timm` - InternVL3 filter only
 
 ## Troubleshooting
 
-### macOS SSL Issues
-The script automatically fixes common macOS SSL certificate issues.
+### SSL Certificate Issues
+If you hit `SSL: CERTIFICATE_VERIFY_FAILED` errors (most common on macOS with a
+freshly installed Python), install proper CA certificates rather than disabling
+verification — e.g. run `/Applications/Python 3.x/Install Certificates.command`
+on macOS, or `pip install --upgrade certifi`.
 
 ### API Quota
 YouTube API has daily quotas. The script includes:
@@ -269,7 +272,7 @@ The script includes error handling for rate limits and API errors.
 ### Quality Filter Issues
 - **YOLO model not found**: The model will be downloaded automatically on first use
 - **yt-dlp not found**: Install all dependencies with `pip install -r crawler/requirements.txt`
-- **ffmpeg not found**: Install with `brew install ffmpeg` (macOS) or `apt install ffmpeg` (Ubuntu)
+- **ffmpeg not found**: Install with `brew install ffmpeg` (macOS), `apt install ffmpeg` (Ubuntu), or `winget install ffmpeg` / `choco install ffmpeg` (Windows)
 - **Memory issues**: Use smaller `--per-city` values or disable Stage 2 filtering
 - **Slow processing**: Quality filtering may take longer as it processes more videos to find quality ones
 
@@ -278,10 +281,12 @@ The script includes error handling for rate limits and API errors.
 ```
 .
 ├── crawler/
-│   ├── pedx-crawler.py              # Main PedX crawler script
-│   ├── video_quality_filter.py      # Two-stage quality filtering system
-│   ├── requirements.txt             # Python dependencies
-│   └── QUALITY_FILTER_README.md     # Detailed quality filter documentation
+│   ├── pedx-crawler.py                    # Main PedX crawler script
+│   ├── video_quality_filter_yolo.py      # YOLO11 quality filter (Stage 2A)
+│   ├── video_quality_filter_internvl3.py # InternVL3 quality filter (Stage 2B)
+│   ├── legacy/                            # Archived earlier version
+│   ├── requirements.txt                  # Python dependencies
+│   └── QUALITY_FILTER_README.md          # Detailed quality filter documentation
 ├── data/
 │   ├── cities.txt                   # Input cities list
 │   └── outputs/                     # Output CSV files (gitignored)

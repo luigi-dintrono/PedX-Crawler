@@ -64,9 +64,11 @@ test-filtered:
 test-filtered-recent:
 	python3 crawler/pedx-crawler.py --enable-quality-filter --since 2025-01-01 --per-city 2 --verbose
 
-# Clean temporary files from quality filter
+# Clean temporary files from quality filter.
+# When run from the repo root the default --temp-dir ('tmp') resolves to
+# ./tmp, so clean both that and the legacy crawler/tmp location.
 clean-temp:
-	rm -rf crawler/tmp/*
+	rm -rf tmp/* crawler/tmp/*
 
 # CI-friendly run (assumes API key is set via environment)
 ci-run:
