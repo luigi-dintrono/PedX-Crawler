@@ -58,6 +58,30 @@ echo "YOUR_API_KEY" > api_key.txt
 python3 crawler/pedx-crawler.py --api-key-file api_key.txt
 ```
 
+## Feeding PedX-Insight
+
+The crawler's `discovery.csv` is converted into PedX-Insight's input CSVs with the bridge script:
+
+```bash
+python scripts/discovery_to_mapping.py \
+    --discovery data/outputs/discovery.csv \
+    --out-mapping-one-each ../PedX-Insight/mapping_one_each.csv \
+    --out-mapping ../PedX-Insight/mapping.csv \
+    --append
+```
+
+- `mapping_one_each.csv` drives PedX-Insight's `run.py` (download → analyze → delete per video).
+  Names are generated underscore-free (`London1`, `Toronto2`, …) so the `<name>_<videoid>`
+  folder convention splits correctly at the first underscore even for YouTube ids that
+  contain underscores.
+- `mapping.csv` gets one row per city (`city`, `country`, `videos` list, `upload_date` from
+  `published_at`, `channel`); the socio-economic columns (lat/lon, population, …) are left
+  blank — they come from external enrichment, not the crawler.
+- `--append` merges into existing files and dedups video ids globally (idempotent re-runs).
+- End-to-end chain: crawler → `discovery.csv` → this converter → PedX-Insight
+  `run.py --localize` → `get_all_video_info.py` / `get_all_video_locations.py` →
+  PedX-Visualizer `make db-pipeline` (real video coordinates on the Globe).
+
 ## Usage
 
 ### Basic usage

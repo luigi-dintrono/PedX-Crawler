@@ -14,6 +14,15 @@ import argparse
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+# Windows consoles default to a legacy code page (cp1252); printing a video title
+# containing an emoji then raises UnicodeEncodeError, which the search loop's
+# catch-all turns into a silently discarded search term. Force UTF-8 with
+# replacement so no title can crash a crawl.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
@@ -310,9 +319,15 @@ def convert_date_to_iso(since_date: str) -> str:
         sys.exit(1)
 
 
-def load_cities(file_path: str) -> List[str]:
-    """Load cities from text file."""
+def load_cities(file_path: str) -> tuple:
+    """Load cities from text file.
+
+    Returns (cities, country_map): the city names in file order, plus a
+    {city: country_code} map for lines using the "City,CC" format (previously
+    the CC was parsed and discarded). Cities without a CC are absent from the map.
+    """
     cities = []
+    country_map = {}
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -320,7 +335,11 @@ def load_cities(file_path: str) -> List[str]:
                 if city and not city.startswith('#'):
                     # Handle "City,CC" format
                     if ',' in city:
-                        city = city.split(',')[0].strip()
+                        city, _, cc = city.partition(',')
+                        city = city.strip()
+                        cc = cc.strip().upper()
+                        if cc:
+                            country_map[city] = cc
                     cities.append(city)
     except FileNotFoundError:
         print(f"Error: Cities file not found at {file_path}")
@@ -328,8 +347,8 @@ def load_cities(file_path: str) -> List[str]:
     except Exception as e:
         print(f"Error reading cities file: {e}")
         sys.exit(1)
-    
-    return cities
+
+    return cities, country_map
 
 
 def get_unique_filename(output_path: str) -> str:
@@ -354,9 +373,12 @@ def get_unique_filename(output_path: str) -> str:
 
 def save_to_csv(videos: List[Dict[str, Any]], output_path: str):
     """Save video data to CSV file with automatic conflict resolution."""
+    # published_at and country_code are APPENDED (downstream readers index by name);
+    # published_at feeds mapping.csv's upload_date, country_code feeds its country.
     fieldnames = [
         'id', 'name', 'city', 'video', 'video_url', 'time_of_day',
-        'start_time', 'end_time', 'region_code', 'channel_name', 'channel_url'
+        'start_time', 'end_time', 'region_code', 'channel_name', 'channel_url',
+        'published_at', 'country_code'
     ]
     
     # Ensure output directory exists (skip when --output is a bare filename,
@@ -369,8 +391,7 @@ def save_to_csv(videos: List[Dict[str, Any]], output_path: str):
     unique_path = get_unique_filename(output_path)
 
     with open(unique_path, 'w', newline='', encoding='utf-8') as csvfile:
-        # extrasaction='ignore' drops helper fields (e.g. published_at) that the
-        # quality filter uses but that are not part of the CSV schema.
+        # extrasaction='ignore' drops any future helper fields not in the schema.
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(videos)
@@ -488,7 +509,7 @@ def main():
             print("Continuing without quality filtering...")
     
     # Load cities
-    cities = load_cities(args.cities_file)
+    cities, country_map = load_cities(args.cities_file)
     if args.verbose:
         print(f"Loaded {len(cities)} cities: {', '.join(cities)}")
         print(f"Searching for videos published after {args.since} ({since_date_iso})")
@@ -518,6 +539,10 @@ def main():
                 since_date_iso, 
                 use_single_search=not args.use_multiple_search
             )
+            # Country code: prefer the explicit CC from cities.txt ("City,CC"),
+            # falling back to the per-video region_code heuristic.
+            for v in videos:
+                v['country_code'] = country_map.get(city) or v.get('region_code', 'UNKNOWN')
             all_videos.extend(videos)
             if args.verbose:
                 print(f"  Found {len(videos)} videos for {city}")
