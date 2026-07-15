@@ -6,7 +6,9 @@ A minimal, production-lean MVP that discovers YouTube street-crossing videos by 
 
 - 🔍 Discovers YouTube street-crossing videos by city using tuned search terms
 - 🎯 **Two-stage quality filtering** - Ensures only high-quality videos are added to CSV
-- 📊 Outputs CSV with columns: `id`, `name`, `city`, `video`, `video_url`, `time_of_day`, `start_time`, `end_time`, `region_code`, `channel_name`, `channel_url`
+- 📊 Outputs CSV with core columns (`id`, `name`, `city`, `video`, `video_url`, `time_of_day`, `start_time`, `end_time`, `region_code`, `channel_name`, `channel_url`) plus free enrichment fields (`published_at`, `country_code`, `duration_seconds`, `view_count`, `like_count`, `comment_count`, `thumbnail_url`, `latitude`, `longitude`)
+- ♻️ Incremental crawling: `--append` + `--exclude-existing` skip already-known videos to save quota, and results are saved even if a run is interrupted
+- 👀 `--dry-run` previews the plan and quota cost without spending a unit
 - 🔐 Secure API key handling (supports `.env` and `--api-key-file`)
 - 🚀 Easy local and CI execution via Makefile
 - ⚡ Quota-optimized search (5x more cities with same API quota)
@@ -99,6 +101,24 @@ python3 crawler/pedx-crawler.py \
   --verbose
 ```
 
+### Preview a run without spending quota
+```bash
+# Prints the plan (cities, output, estimated quota) and exits — no API calls
+python3 crawler/pedx-crawler.py --dry-run --per-city 50 --use-multiple-search
+```
+
+### Incremental / top-up crawls (save quota, avoid duplicates)
+```bash
+# Append new finds to an existing CSV and skip video IDs already present in it
+python3 crawler/pedx-crawler.py --append --output data/outputs/discovery.csv
+
+# Also skip IDs found in other prior CSVs (repeatable) so nothing is re-crawled
+python3 crawler/pedx-crawler.py --append --output data/outputs/discovery.csv \
+  --exclude-existing data/outputs/batch10.csv --exclude-existing data/outputs/ny_extra.csv
+```
+Crash-safe: if the run is interrupted (Ctrl-C), hits the quota cap, or errors out,
+whatever has been discovered so far is still written to the output CSV.
+
 ### Quota-optimized mode (recommended)
 ```bash
 # Uses single search term per city (100 units vs 500)
@@ -123,7 +143,8 @@ python3 crawler/pedx-crawler.py --enable-quality-filter --per-city 10 --verbose
 - `make run` - Run PedX crawler with default settings
 - `make run-verbose` - Run with verbose output
 - `make run-filtered` - Run with quality filter enabled
-- `make test` - Test with small sample (5 results per city)
+- `make test` - Test with small sample (5 results per city, live crawl)
+- `make test-unit` - Run the offline pytest suite (no API key / network needed)
 - `make test-filtered` - Test with quality filter (2 videos per city)
 - `make test-filtered-recent` - Test with quality filter + recent date
 - `make test-custom` - Test with custom date and per-city limit
@@ -150,10 +171,19 @@ The script generates a CSV file with the following columns:
 - `video_url` - Full YouTube URL
 - `time_of_day` - Extracted from title (morning/afternoon/evening/night/unknown)
 - `start_time` - Default start time (0:00)
-- `end_time` - Video duration
-- `region_code` - Country code (extracted from city)
+- `end_time` - Video duration (H:MM:SS)
+- `region_code` - Country code (extracted from city name)
 - `channel_name` - YouTube channel name
 - `channel_url` - YouTube channel URL
+- `published_at` - Upload timestamp (ISO 8601)
+- `country_code` - Country code (from `City,CC` in the cities file, else `region_code`)
+- `duration_seconds` - Video duration in seconds (integer)
+- `view_count`, `like_count`, `comment_count` - Public statistics (blank if hidden)
+- `thumbnail_url` - Thumbnail image URL
+- `latitude`, `longitude` - Geotag coordinates (only when the uploader set them)
+
+> The last eight columns are enrichment fields pulled from the same `videos.list`
+> call the crawler already makes, so they add **no** extra API quota.
 
 ## Quality Filtering
 
@@ -306,8 +336,10 @@ The script includes error handling for rate limits and API errors.
 │   ├── pedx-crawler.py                    # Main PedX crawler script
 │   ├── video_quality_filter_yolo.py      # YOLO quality filter, YOLO26 default (Stage 2A)
 │   ├── video_quality_filter_internvl3.py # InternVL3 quality filter (Stage 2B)
+│   ├── tests/                            # Offline pytest suite (make test-unit)
 │   ├── legacy/                            # Archived earlier version
 │   ├── requirements.txt                  # Python dependencies
+│   ├── requirements-dev.txt              # Test dependencies (pytest)
 │   └── QUALITY_FILTER_README.md          # Detailed quality filter documentation
 ├── data/
 │   ├── cities.txt                   # Input cities list

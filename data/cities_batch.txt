@@ -1,0 +1,6 @@
+# Batch cities for 10-video run
+New York,US
+Tokyo,JP
+Paris,FR
+Berlin,DE
+Mumbai,IN

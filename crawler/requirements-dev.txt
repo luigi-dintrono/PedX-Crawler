@@ -1,0 +1,4 @@
+# Development / test dependencies.
+# Run the suite with:  pytest crawler/tests
+-r requirements.txt
+pytest>=8.0

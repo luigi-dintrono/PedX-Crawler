@@ -1,6 +1,6 @@
 # PedX Crawler - Road-Crossing Video Discovery Makefile
 
-.PHONY: help install setup run clean test run-filtered test-filtered clean-temp run-yolo test-yolo run-internvl3 test-internvl3
+.PHONY: help install setup run clean test test-unit run-filtered test-filtered clean-temp run-yolo test-yolo run-internvl3 test-internvl3
 
 # Default target
 help:
@@ -10,7 +10,8 @@ help:
 	@echo "  run           - Run the PedX crawler script"
 	@echo "  run-verbose   - Run with verbose output"
 	@echo "  run-filtered  - Run with quality filter enabled"
-	@echo "  test          - Test the script with a small sample"
+	@echo "  test          - Test the script with a small sample (live crawl)"
+	@echo "  test-unit     - Run the offline pytest suite (no API key / network)"
 	@echo "  test-filtered - Test with quality filter (small sample)"
 	@echo "  run-yolo      - Run with YOLO quality filter"
 	@echo "  test-yolo     - Test with YOLO quality filter (small sample)"
@@ -47,6 +48,10 @@ clean:
 # Test with a small sample
 test:
 	python3 crawler/pedx-crawler.py --per-city 5 --verbose
+
+# Run the offline unit-test suite (stubs external deps; no API key needed)
+test-unit:
+	python3 -m pytest crawler/tests -q
 
 # Test with custom date and per-city limit
 test-custom:
