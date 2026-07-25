@@ -1,1 +1,1 @@
-id,name,city,video,video_url,time_of_day,start_time,end_time,region_code,channel_name,channel_url
+id,name,city,video,video_url,time_of_day,start_time,end_time,region_code,channel_name,channel_url,published_at,country_code,duration_seconds,view_count,like_count,comment_count,thumbnail_url,latitude,longitude

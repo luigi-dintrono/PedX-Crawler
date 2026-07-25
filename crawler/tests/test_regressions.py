@@ -64,13 +64,68 @@ def test_quota_exceeded_in_details_propagates(pedx):
 def test_append_incompatible_header_falls_back(pedx, tmp_path):
     out = str(tmp_path / "old.csv")
     with open(out, 'w', newline='', encoding='utf-8') as f:
-        f.write("id,name,city\nx,old,London\n")  # narrow legacy schema
+        # Not a prefix of CSV_FIELDNAMES (column order differs), so it cannot be
+        # migrated and must be diverted instead.
+        f.write("id,city,name\nx,London,old\n")
     path = pedx.save_to_csv([_row('v1')], out, append=True)
     assert path != out                                   # diverted to a new file
     with open(path, newline='', encoding='utf-8') as f:
         rows = list(csv.DictReader(f))
     assert rows[0]['id'] == 'v1' and 'duration_seconds' in rows[0]
     assert len(open(out, encoding='utf-8').read().splitlines()) == 2  # original untouched
+
+
+@pytest.mark.parametrize("n_cols", [11, 13])
+def test_append_upgrades_prefix_schema_in_place(pedx, tmp_path, n_cols):
+    """Older discovery CSVs have a header that is a strict PREFIX of the current one.
+    Those must be widened in place and appended to — not diverted to a new file, which
+    left the target never growing and the diverted IDs outside the next run's dedup set.
+    """
+    out = str(tmp_path / "legacy.csv")
+    old_fields = pedx.CSV_FIELDNAMES[:n_cols]
+    legacy = {k: f"old-{k}" for k in old_fields}
+    legacy['id'] = 'old1'
+    with open(out, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=old_fields)
+        w.writeheader()
+        w.writerow(legacy)
+
+    path = pedx.save_to_csv([_row('v1')], out, append=True)
+
+    assert path == out                                   # same file, no fallback
+    assert list(tmp_path.glob('legacy_*.csv')) == []      # nothing diverted
+    assert list(tmp_path.glob('*.upgrading')) == []       # temp file cleaned up
+    with open(out, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        assert next(reader) == pedx.CSV_FIELDNAMES       # full header
+        widths = {len(r) for r in reader}
+    assert widths == {len(pedx.CSV_FIELDNAMES)}          # no ragged rows
+    rows = _read_rows(out)
+    assert [r['id'] for r in rows] == ['old1', 'v1']
+    # migrated row keeps its old values and gets '' for the new columns
+    assert all(rows[0][k] == legacy[k] for k in old_fields)
+    assert all(rows[0][k] == '' for k in pedx.CSV_FIELDNAMES[n_cols:])
+    assert rows[1]['duration_seconds'] == '150'          # appended row is complete
+
+
+def test_upgrade_then_append_is_idempotent(pedx, tmp_path):
+    """A second append must not re-upgrade or duplicate the header."""
+    out = str(tmp_path / "legacy.csv")
+    old_fields = pedx.CSV_FIELDNAMES[:11]
+    with open(out, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=old_fields)
+        w.writeheader()
+        w.writerow({k: '' for k in old_fields} | {'id': 'old1'})
+    pedx.save_to_csv([_row('v1')], out, append=True)
+    pedx.save_to_csv([_row('v2')], out, append=True)
+    content = open(out, encoding='utf-8').read()
+    assert content.count('id,name,city') == 1
+    assert [r['id'] for r in _read_rows(out)] == ['old1', 'v1', 'v2']
+
+
+def _read_rows(path):
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        return list(csv.DictReader(f))
 
 
 def test_append_empty_file_writes_header(pedx, tmp_path):

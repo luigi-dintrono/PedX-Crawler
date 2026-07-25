@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 CRAWLER_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = CRAWLER_DIR.parent
 
 
 def _stub(name, **attrs):
@@ -22,12 +23,16 @@ def _stub(name, **attrs):
     return module
 
 
-def _load(filename, module_name):
-    spec = importlib.util.spec_from_file_location(module_name, CRAWLER_DIR / filename)
+def _load_path(path, module_name):
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load(filename, module_name):
+    return _load_path(CRAWLER_DIR / filename, module_name)
 
 
 @pytest.fixture
@@ -38,6 +43,16 @@ def pedx():
     _stub('googleapiclient.errors', HttpError=type('HttpError', (Exception,), {}))
     _stub('dotenv', load_dotenv=lambda *a, **k: None)
     return _load('pedx-crawler.py', 'pedx_under_test')
+
+
+@pytest.fixture
+def bridge():
+    """The Crawler -> PedX-Insight converter (scripts/discovery_to_mapping.py).
+
+    Pure stdlib, so nothing needs stubbing; it lives outside crawler/ hence the
+    explicit path.
+    """
+    return _load_path(REPO_ROOT / 'scripts' / 'discovery_to_mapping.py', 'bridge_under_test')
 
 
 @pytest.fixture
@@ -128,6 +143,36 @@ def make_search_item(vid, title="pedestrian crossing at intersection"):
             'snippet': {'title': title, 'channelTitle': f'ch-{vid}',
                         'channelId': f'cid-{vid}', 'publishedAt': '2026-06-01T00:00:00Z',
                         'thumbnails': {'high': {'url': f'https://i.ytimg.com/{vid}.jpg'}}}}
+
+
+DISCOVERY_FIELDS = [
+    'id', 'name', 'city', 'video', 'video_url', 'time_of_day', 'start_time', 'end_time',
+    'region_code', 'channel_name', 'channel_url', 'published_at', 'country_code',
+    'duration_seconds', 'view_count', 'like_count', 'comment_count', 'thumbnail_url',
+    'latitude', 'longitude',
+]
+
+
+def write_discovery_csv(path, rows, fields=None):
+    """Write a discovery CSV (current schema by default) for the bridge tests."""
+    import csv
+    fields = fields or DISCOVERY_FIELDS
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, '') for key in fields})
+
+
+def discovery_row(vid, city='London', cc='GB', time_of_day='unknown',
+                  end_time='0:02:30', published_at='2023-08-29T10:00:00Z',
+                  channel_name='ChanX'):
+    """One discovery CSV row, keyword-overridable."""
+    return {'id': vid, 'name': f'{city} pedestrian crossing', 'city': city, 'video': vid,
+            'video_url': f'https://www.youtube.com/watch?v={vid}', 'time_of_day': time_of_day,
+            'start_time': '0:00', 'end_time': end_time, 'region_code': cc,
+            'channel_name': channel_name, 'channel_url': f'https://youtube.com/channel/{vid}',
+            'published_at': published_at, 'country_code': cc}
 
 
 def make_details(vid, duration='PT2M30S', views='1234', lat=None, lon=None):

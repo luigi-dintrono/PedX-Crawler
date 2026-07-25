@@ -207,7 +207,9 @@ make run-internvl3    # Full run with InternVL3 filter
 - `--per-city 5` means **5 quality videos** that pass the filter, not 5 total videos processed
 - If 70% of videos are filtered out, the crawler will process ~17 videos to find 5 quality ones
 - The crawler uses pagination and multiple search terms to ensure it finds enough quality content
-- This ensures your CSV always contains the exact number of high-quality videos you requested
+- The target is a ceiling, not a guarantee: a city yields fewer than requested when its
+  search terms are exhausted, the quota cap is reached, or the internal search-attempt
+  limit (10 requests per city) is hit. Check the per-city run summary for shortfalls.
 
 ### Command Line Options
 

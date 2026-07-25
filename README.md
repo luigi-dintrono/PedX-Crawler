@@ -79,7 +79,20 @@ python scripts/discovery_to_mapping.py \
 - `mapping.csv` gets one row per city (`city`, `country`, `videos` list, `upload_date` from
   `published_at`, `channel`); the socio-economic columns (lat/lon, population, …) are left
   blank — they come from external enrichment, not the crawler.
+- Column shapes match the native file: `videos`, `upload_date`, `vehicle_type`, `fps_list`
+  and `channel` are flat lists (`[a,b]`); `time_of_day`, `start_time` and `end_time` are
+  nested (`[[0],[1]]`). Every one of them stays aligned element-for-element with `videos`
+  — `vehicle_type` / `fps_list` are analysis-derived, so appended videos get a `0`
+  placeholder there when the row already has those lists, and rows that leave them blank
+  keep them blank.
+- `upload_date` is written as `YYYYMMDD` (e.g. `20230829`). Most historical rows use an
+  unpadded `DDMMYYYY` form (`29082023`, `3042024`) which is ambiguous, so new rows use the
+  ISO-ordered form. Nothing in PedX-Insight or PedX-Visualizer parses this column today,
+  so the two forms coexist harmlessly.
 - `--append` merges into existing files and dedups video ids globally (idempotent re-runs).
+  Rows for other cities are preserved byte-for-byte, including their nested lists.
+- Shortcut: `make bridge` runs the command above against `../PedX-Insight`; override with
+  `make bridge INSIGHT=/path/to/PedX-Insight DISCOVERY=data/outputs/discovery.csv`.
 - End-to-end chain: crawler → `discovery.csv` → this converter → PedX-Insight
   `run.py --localize` → `get_all_video_info.py` / `get_all_video_locations.py` →
   PedX-Visualizer `make db-pipeline` (real video coordinates on the Globe).
@@ -101,6 +114,38 @@ python3 crawler/pedx-crawler.py \
   --verbose
 ```
 
+### All command-line options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--api-key KEY` | YouTube API key (else `--api-key-file`, else `$YOUTUBE_API_KEY`) | – |
+| `--api-key-file PATH` | Read the API key from a file | – |
+| `--cities-file PATH` | Cities list, one `City` or `City,CC` per line | `data/cities.txt` |
+| `--output PATH` | Output CSV path | `data/outputs/discovery.csv` |
+| `--append` | Append to `--output` (migrating an older schema if needed) instead of writing a new numbered file | off |
+| `--exclude-existing CSV` | Skip video IDs already in this CSV; repeatable | – |
+| `--per-city N` | Target number of quality videos per city | 50 |
+| `--since YYYY-MM-DD` | Only videos published after this date | `2020-01-01` |
+| `--use-multiple-search` | Use 5 search terms per city instead of 1 (5x quota) | off |
+| `--quota-limit N` | Daily quota budget; the crawler stops before exceeding it | 10000 |
+| `--dry-run` | Print the plan and quota estimate, then exit without any API call | off |
+| `--verbose`, `-v` | Verbose progress and quota output | off |
+| `--filter {none,yolo,internvl3}` | Unified quality-filter switch; overrides `--enable-quality-filter` / `--filter-type` | – |
+| `--enable-quality-filter` | Enable quality filtering (legacy pair with `--filter-type`) | off |
+| `--filter-type {yolo,internvl3}` | Which filter backend to use | `yolo` |
+| `--max-upload-months N` | Reject videos older than this many months | 36 |
+| `--temp-dir DIR` | Scratch directory for micro-clips and frames | `tmp` |
+| `--yolo-model PATH` | Ultralytics YOLO checkpoint | `yolo26n.pt` |
+| `--internvl3-model NAME` | HuggingFace model id for InternVL3 | `OpenGVLab/InternVL3-8B` |
+| `--threshold FLOAT` | InternVL3 acceptance threshold (keep above 0) | 0.9 |
+| `--device {auto,cpu,cuda,mps}` | Device for InternVL3 | `auto` |
+| `--max-results N` | Deprecated alias for `--per-city` | – |
+
+`--filter` is the shorthand for the filter pair: `--filter yolo` is equivalent to
+`--enable-quality-filter --filter-type yolo`, and `--filter none` disables filtering
+even if `--enable-quality-filter` is also present. See
+[Quality Filter Documentation](crawler/QUALITY_FILTER_README.md) for the filter details.
+
 ### Preview a run without spending quota
 ```bash
 # Prints the plan (cities, output, estimated quota) and exits — no API calls
@@ -118,6 +163,12 @@ python3 crawler/pedx-crawler.py --append --output data/outputs/discovery.csv \
 ```
 Crash-safe: if the run is interrupted (Ctrl-C), hits the quota cap, or errors out,
 whatever has been discovered so far is still written to the output CSV.
+
+`--append` also migrates older CSVs forward. Columns are only ever added to the schema,
+so a file from an earlier version has a header that is a prefix of the current one; the
+crawler widens it in place (new columns filled with blanks, existing rows untouched) and
+then appends. Only a file whose columns genuinely disagree — a different order, say — is
+left alone, with the run diverted to a new numbered file and a warning printed.
 
 ### Quota-optimized mode (recommended)
 ```bash
@@ -139,10 +190,13 @@ python3 crawler/pedx-crawler.py --enable-quality-filter --per-city 10 --verbose
 
 ### Makefile targets
 - `make install` - Install Python dependencies
+- `make install-dev` - Install dependencies plus the test extras (pytest)
 - `make setup` - Copy .env.example to .env
 - `make run` - Run PedX crawler with default settings
 - `make run-verbose` - Run with verbose output
+- `make dry-run` - Preview the plan and quota cost without spending a unit
 - `make run-filtered` - Run with quality filter enabled
+- `make bridge` - Convert `discovery.csv` into PedX-Insight's mapping CSVs
 - `make test` - Test with small sample (5 results per city, live crawl)
 - `make test-unit` - Run the offline pytest suite (no API key / network needed)
 - `make test-filtered` - Test with quality filter (2 videos per city)
@@ -151,6 +205,13 @@ python3 crawler/pedx-crawler.py --enable-quality-filter --per-city 10 --verbose
 - `make clean` - Clean output files
 - `make clean-temp` - Clean temporary files from quality filter
 - `make ci-run` - CI-friendly run (assumes API key in environment)
+
+Every target runs through `$(PYTHON)`, which defaults to `python3`. On Windows `python3`
+is usually a Microsoft Store stub, so pass the launcher instead:
+
+```bash
+make test-unit PYTHON=py
+```
 
 ## Configuration
 
@@ -210,7 +271,10 @@ The PedX Crawler includes an advanced two-stage quality filtering system to ensu
 - `--per-city 5` means **5 quality videos** that pass the filter
 - If 70% of videos are filtered out, the crawler will process ~17 videos to find 5 quality ones
 - Uses pagination and multiple search terms to ensure enough quality content
-- Guarantees your CSV contains exactly the number of high-quality videos requested
+- The target is a ceiling, not a guarantee: a city yields fewer than requested when the
+  search terms run out of results, the quota cap is reached, or the internal
+  search-attempt limit (10 requests per city) is hit. The per-city counts in the run
+  summary tell you which cities came up short.
 
 ### Usage
 
@@ -341,9 +405,11 @@ The script includes error handling for rate limits and API errors.
 │   ├── requirements.txt                  # Python dependencies
 │   ├── requirements-dev.txt              # Test dependencies (pytest)
 │   └── QUALITY_FILTER_README.md          # Detailed quality filter documentation
+├── scripts/
+│   └── discovery_to_mapping.py      # Bridge: discovery.csv -> PedX-Insight CSVs
 ├── data/
 │   ├── cities.txt                   # Input cities list
-│   └── outputs/                     # Output CSV files (gitignored)
+│   └── outputs/                     # Output CSV files (committed; see .gitignore)
 ├── .env.example                     # Environment template
 ├── .gitignore                       # Git ignore rules
 ├── Makefile                         # Build automation
