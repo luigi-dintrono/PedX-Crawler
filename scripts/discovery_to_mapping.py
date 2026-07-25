@@ -13,9 +13,15 @@ Conventions preserved (from PedX-Insight):
     {name}_{video_id}.mp4 and the analysis folder <name>_<video_id>, which everything
     downstream splits at the FIRST underscore (YouTube ids may contain underscores).
     We use dataset.py's convention: name = City (spaces/underscores removed) + index.
-  * mapping.csv 'videos' is a bracketed, comma+space separated, unquoted id list:
-    "[id1, id2]"; time_of_day/start_time/end_time/upload_date are nested lists
-    aligned with videos, e.g. "[[0], [1]]".
+  * mapping.csv 'videos' is a bracketed, comma-separated, unquoted id list "[id1,id2]".
+    Two different list shapes are aligned with it, matching the native file:
+      - NESTED  ("[[0],[1]]"):  time_of_day, start_time, end_time
+      - FLAT    ("[a,b]"):      upload_date, vehicle_type, fps_list, channel
+  * upload_date is written as YYYYMMDD (e.g. 20230829). NOTE: most rows in the
+    historical mapping.csv use an unpadded DDMMYYYY form (29082023, 3042024) which is
+    ambiguous (3042024 reads as either 3/04 or 30/4), so this converter emits the
+    unambiguous ISO-ordered form. No code in PedX-Insight or PedX-Visualizer parses
+    this column today, so the two forms coexist without breaking anything.
 
 Usage:
   python scripts/discovery_to_mapping.py \
@@ -95,11 +101,6 @@ def bracketed(values):
     """Insight's list format: '[a,b,c]' (unquoted, no spaces — matches the native
     mapping.csv style; Insight's parsers strip whitespace so both forms read fine)."""
     return '[' + ','.join(str(v) for v in values) + ']'
-
-
-def nested(values):
-    """Insight's nested list format: '[[a],[b]]' (native no-space style)."""
-    return '[' + ','.join(f'[{v}]' for v in values) + ']'
 
 
 def parse_bracketed(raw):
@@ -227,12 +228,23 @@ def main():
         entry.setdefault('_end', parse_nested(entry.get('end_time')))
         entry.setdefault('_upload', parse_bracketed(entry.get('upload_date')))
         entry.setdefault('_channel', parse_bracketed(entry.get('channel')))
+        entry.setdefault('_vtype', parse_bracketed(entry.get('vehicle_type')))
+        entry.setdefault('_fps', parse_bracketed(entry.get('fps_list')))
         entry['_videos'].append(vid)
         entry['_tod'].append(f'[{tod}]')
         entry['_start'].append('[0]')
         entry['_end'].append(f'[{end_sec if end_sec is not None else 0}]')
         entry['_upload'].append(str(upload))
         entry['_channel'].append(channel or 'unknown')
+        # vehicle_type/fps_list are analysis-derived and unknown to the crawler, but they
+        # are aligned element-for-element with 'videos'. Extend them only when the row
+        # already has them populated (crawler-only rows keep them blank), padding with
+        # 0 = unknown rather than a fabricated plausible value (e.g. fps 30), so the
+        # lists never fall out of step with 'videos'.
+        if entry['_vtype']:
+            entry['_vtype'].append('0')
+        if entry['_fps']:
+            entry['_fps'].append('0')
 
         converted += 1
 
@@ -259,6 +271,13 @@ def main():
             entry['end_time'] = '[' + ','.join(entry.pop('_end')) + ']'
             entry['upload_date'] = bracketed(entry.pop('_upload'))
             entry['channel'] = bracketed(entry.pop('_channel'))
+            # Only rewrite these two when the row actually had them; otherwise leave
+            # the original blank cell alone.
+            vtype, fps = entry.pop('_vtype'), entry.pop('_fps')
+            if vtype:
+                entry['vehicle_type'] = bracketed(vtype)
+            if fps:
+                entry['fps_list'] = bracketed(fps)
     with open(args.out_mapping, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=MAPPING_HEADER, extrasaction='ignore')
         w.writeheader()

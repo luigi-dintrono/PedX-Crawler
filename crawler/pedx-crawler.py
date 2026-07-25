@@ -377,10 +377,6 @@ class YouTubeDiscovery:
         else:
             return 'unknown'
 
-    def _extract_duration(self, video_details: Dict[str, Any]) -> str:
-        """Extract duration from a videos.list item (ISO 8601 -> H:MM:SS)."""
-        return self._format_duration(video_details.get('contentDetails', {}).get('duration', 'PT0S'))
-
     def _format_duration(self, duration: str) -> str:
         """Format an ISO 8601 duration (e.g. PT1H2M3S) as H:MM:SS."""
         # Parse the hours/minutes/seconds components independently so none is
@@ -530,19 +526,47 @@ def save_to_csv(videos: List[Dict[str, Any]], output_path: str, append: bool = F
         has_content = os.path.exists(output_path) and os.path.getsize(output_path) > 0
         if has_content:
             # Appending rows with a different column set than the existing header
-            # would produce a ragged, misaligned CSV. Verify the schema matches;
-            # if not (e.g. a file from an older version), write a new file instead.
+            # would produce a ragged, misaligned CSV, so the header must match.
             with open(output_path, 'r', newline='', encoding='utf-8-sig') as existing:
                 existing_header = next(csv.reader(existing), [])
             if existing_header != CSV_FIELDNAMES:
-                fallback = get_unique_filename(output_path)
-                print(f"Warning: '{output_path}' has an incompatible CSV header; "
-                      f"writing to '{fallback}' instead of appending.")
-                return _write_rows(fallback, videos, write_header=True, mode='w')
+                # Columns are only ever APPENDED to CSV_FIELDNAMES, so a file written
+                # by an older version has a header that is a strict prefix of the
+                # current one and can be widened losslessly. Upgrade it in place and
+                # append, instead of silently diverting the run to a new file (which
+                # left the target file never growing and the diverted IDs outside the
+                # next run's dedup set, re-spending quota on the same videos).
+                if existing_header and existing_header == CSV_FIELDNAMES[:len(existing_header)]:
+                    _upgrade_csv_schema(output_path)
+                    print(f"Note: upgraded '{output_path}' from {len(existing_header)} to "
+                          f"{len(CSV_FIELDNAMES)} columns before appending.")
+                else:
+                    fallback = get_unique_filename(output_path)
+                    print(f"Warning: '{output_path}' has an incompatible CSV header; "
+                          f"writing to '{fallback}' instead of appending.")
+                    return _write_rows(fallback, videos, write_header=True, mode='w')
         return _write_rows(output_path, videos, write_header=not has_content, mode='a')
 
     # Get unique filename to avoid overwriting existing files
     return _write_rows(get_unique_filename(output_path), videos, write_header=True, mode='w')
+
+
+def _upgrade_csv_schema(path: str) -> None:
+    """Rewrite a prefix-schema discovery CSV in place with the full current header.
+
+    Rows are widened by filling the newly added columns with ''. The rewrite goes to a
+    temporary file and is swapped in with os.replace, so an interrupted upgrade cannot
+    leave the original truncated.
+    """
+    with open(path, 'r', newline='', encoding='utf-8-sig') as f:
+        rows = list(csv.DictReader(f))
+    tmp = path + '.upgrading'
+    with open(tmp, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES, extrasaction='ignore')
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: (row.get(key) or '') for key in CSV_FIELDNAMES})
+    os.replace(tmp, path)
 
 
 def _write_rows(path: str, videos: List[Dict[str, Any]], write_header: bool, mode: str) -> str:
