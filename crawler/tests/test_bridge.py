@@ -39,8 +39,8 @@ def test_parse_duration_seconds(bridge, hms, secs):
 
 
 @pytest.mark.parametrize("value,flag", [
-    ('night', 1), ('evening', 1), ('morning', 0), ('afternoon', 0),
-    ('unknown', 0), ('', 0), ('NIGHT', 1),
+    ('night', 1), ('evening', 1), ('morning', 0), ('afternoon', 0), ('day', 0),
+    ('unknown', -1), ('', -1), (None, -1), ('NIGHT', 1),  # unknown is never counted as day
 ])
 def test_time_of_day_to_flag(bridge, value, flag):
     assert bridge.time_of_day_to_flag(value) == flag
@@ -103,7 +103,7 @@ def test_basic_conversion(bridge, monkeypatch, tmp_path):
     assert [r['name'] for r in oe] == ['NewYork1', 'NewYork2', 'Ulm1']
     assert [r['id'] for r in oe] == ['1', '2', '3']
     assert [r['end_time'] for r in oe] == ['150', '65', '3723']
-    assert [r['time_of_day'] for r in oe] == ['1', '0', '0']
+    assert [r['time_of_day'] for r in oe] == ['1', '0', '-1']
     assert all('_' not in r['name'] for r in oe)
     # a video id containing '_' must survive intact while its name stays underscore-free
     assert oe[0]['video'] == 'aaa_111'
@@ -119,10 +119,14 @@ def test_mapping_list_shapes(bridge, monkeypatch, tmp_path):
     disc = tmp_path / 'disc.csv'
     write_discovery_csv(disc, [
         discovery_row('v1', 'Ulm', 'DE', time_of_day='night', end_time='0:00:30',
-                      published_at='2023-08-29T10:00:00Z', channel_name='ChanA'),
+                      published_at='2023-08-29T10:00:00Z', channel_name='Chan, A'),
         discovery_row('v2', 'Ulm', 'DE', time_of_day='morning', end_time='0:01:00',
                       published_at='2024-04-03T10:00:00Z', channel_name='ChanB'),
     ])
+    # Channel IDs (not display names) go into the list, parsed from channel_url.
+    rows = list(csv.DictReader(open(disc, encoding='utf-8')))
+    rows[0]['channel_url'] = 'https://www.youtube.com/channel/UCBcVQr-07MH-p9e2kRTdB3A'
+    write_discovery_csv(disc, rows)
     _, mp = _run(bridge, monkeypatch, tmp_path, disc)
     row = mp[0]
     assert row['videos'] == '[v1,v2]'
@@ -130,7 +134,7 @@ def test_mapping_list_shapes(bridge, monkeypatch, tmp_path):
     assert row['start_time'] == '[[0],[0]]'
     assert row['end_time'] == '[[30],[60]]'
     assert row['upload_date'] == '[20230829,20240403]'
-    assert row['channel'] == '[ChanA,ChanB]'
+    assert row['channel'] == '[UCBcVQr-07MH-p9e2kRTdB3A,unknown]'  # comma-safe IDs
 
 
 def test_unknown_country_left_blank_and_unmapped_code_passes_through(bridge, monkeypatch, tmp_path):
@@ -295,3 +299,59 @@ def test_one_each_names_split_at_first_underscore(bridge, monkeypatch, tmp_path)
         folder = f"{row['name']}_{row['video']}"
         assert folder.split('_', 1)[0] == row['name']
         assert folder.split('_', 1)[1] == row['video']
+
+
+# --- geocoding of new rows ------------------------------------------------------
+
+@pytest.fixture
+def geonames(bridge):
+    if not bridge.Gazetteer().available:
+        pytest.skip('geonamescache not installed')
+
+
+def test_new_city_rows_are_geocoded(bridge, geonames, monkeypatch, tmp_path):
+    disc = tmp_path / 'disc.csv'
+    write_discovery_csv(disc, [discovery_row('v1', 'Ulm', 'DE')])
+    _, mp = _run(bridge, monkeypatch, tmp_path, disc)
+    row = mp[0]
+    assert (row['country'], row['iso3'], row['continent']) == ('Germany', 'DEU', 'Europe')
+    assert abs(float(row['lat']) - 48.40) < 0.1 and abs(float(row['lon']) - 9.99) < 0.1
+    assert float(row['population_city']) > 100000 and float(row['population_country']) > 1e7
+    assert row['gmp'] == '' and row['gini'] == ''   # socio-economic columns stay blank
+
+
+def test_geocoding_reuses_native_country_spelling_and_skips_existing_rows(
+        bridge, geonames, monkeypatch, tmp_path):
+    existing = {col: '' for col in bridge.MAPPING_HEADER}
+    existing.update(id='1', city='Istanbul', country='Turkey', iso3='TUR', continent='Asia',
+                    videos='[a]', time_of_day='[[0]]', start_time='[[0]]', end_time='[[10]]',
+                    upload_date='[20200101]', channel='[UCx]')
+    with open(tmp_path / 'map.csv', 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=bridge.MAPPING_HEADER)
+        w.writeheader()
+        w.writerow(existing)
+    disc = tmp_path / 'disc.csv'
+    write_discovery_csv(disc, [discovery_row('v1', 'Ankara', 'TR'), discovery_row('v2', 'Istanbul', 'TR')])
+    _, mp = _run(bridge, monkeypatch, tmp_path, disc, append=True)
+    by_city = {r['city']: r for r in mp}
+    assert by_city['Ankara']['country'] == 'Turkey'          # native spelling, not GeoNames'
+    assert by_city['Ankara']['continent'] == 'Asia' and by_city['Ankara']['lat']
+    assert by_city['Istanbul']['lat'] == ''                    # existing row never re-geocoded
+
+
+def test_ungeocodable_city_warns(bridge, geonames, monkeypatch, tmp_path, capsys):
+    disc = tmp_path / 'disc.csv'
+    write_discovery_csv(disc, [discovery_row('v1', 'Nowhereville Xyzzy', 'GB'),
+                               discovery_row('v2', 'Portland', 'US')])
+    _, mp = _run(bridge, monkeypatch, tmp_path, disc)
+    out = capsys.readouterr().out
+    assert "could not geocode 'Nowhereville Xyzzy'" in out
+    assert "'Portland' is ambiguous" in out
+    assert mp[0]['lat'] == '' and mp[0]['country'] == 'United Kingdom'
+
+
+def test_mapping_write_is_atomic(bridge, monkeypatch, tmp_path):
+    disc = tmp_path / 'disc.csv'
+    write_discovery_csv(disc, [discovery_row('v1', 'Ulm', 'DE')])
+    _run(bridge, monkeypatch, tmp_path, disc)
+    assert not list(tmp_path.glob('*.tmp'))

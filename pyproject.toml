@@ -1,0 +1,52 @@
+[project]
+name = "pedx-crawler"
+version = "0.2.0"
+description = "Discovers YouTube road-user videos by city for the PedX pipeline (Crawler -> Insight -> Visualizer)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Core: crawl + bridge, no ML. `pip install -e .`
+dependencies = [
+    "google-api-python-client>=2.198.0",
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",          # the localhost range proxy used by the visual filters
+    "geonamescache>=3.0.2",      # offline city / country / coordinate lookup
+]
+
+[project.optional-dependencies]
+# Visual filter, YOLO backend: `pip install -e ".[yolo]"` (also needs ffmpeg on PATH)
+yolo = [
+    "ultralytics>=8.4.92",       # YOLO26 (default) and YOLO11 checkpoints
+    "yt-dlp>=2026.7.4",
+    "Pillow>=10.0",
+]
+# Visual filter, InternVL3 backend (native Transformers, no trust_remote_code):
+# `pip install -e ".[internvl3]"`. Install a CUDA build of torch first if you want a GPU.
+internvl3 = [
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "transformers>=5.13.1",
+    "yt-dlp>=2026.7.4",
+    "Pillow>=10.0",
+]
+# scripts/evaluate_filter.py
+eval = [
+    "numpy>=2.0",
+    "scipy>=1.14",
+]
+# Offline test suite: `pip install -e ".[dev]"` (the ML libraries are stubbed in tests)
+dev = [
+    "pytest>=8.0",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "Pillow>=10.0",
+    "yt-dlp>=2026.7.4",
+]
+
+[tool.setuptools]
+# This is an application, not an importable package: the extras above are the point.
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["crawler/tests"]
+addopts = "-q"

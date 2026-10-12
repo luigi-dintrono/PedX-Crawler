@@ -5,8 +5,7 @@ Bridges the Crawler -> Insight seam:
   discovery.csv (one row per found video)
     -> mapping_one_each.csv  (drives PedX-Insight run.py: download/analyze/delete)
     -> mapping.csv           (per-city row: consumed by Insight aggregators and by
-                              --mode localize city inference; socio-economic columns
-                              are external enrichment and stay blank)
+                              --mode localize city inference)
 
 Conventions preserved (from PedX-Insight):
   * mapping_one_each 'name' must contain NO underscore: run.py builds the video file
@@ -17,6 +16,14 @@ Conventions preserved (from PedX-Insight):
     Two different list shapes are aligned with it, matching the native file:
       - NESTED  ("[[0],[1]]"):  time_of_day, start_time, end_time
       - FLAT    ("[a,b]"):      upload_date, vehicle_type, fps_list, channel
+  * channel holds YouTube channel IDs (UC...), like 99% of the native entries.
+  * time_of_day is 0 (day) / 1 (night); a video whose time of day is unknown gets -1
+    rather than being silently counted as daytime.
+  * Rows this script CREATES get country / iso3 / continent / lat / lon / population
+    from GeoNames (crawler/gazetteer.py); country and continent names reuse the
+    spelling already in mapping.csv for the same iso3. Rows that already exist are
+    never re-geocoded, and the remaining socio-economic columns (gmp, gini, ...) stay
+    blank - they come from external enrichment.
   * upload_date is written as YYYYMMDD (e.g. 20230829). NOTE: most rows in the
     historical mapping.csv use an unpadded DDMMYYYY form (29082023, 3042024) which is
     ambiguous (3042024 reads as either 3/04 or 30/4), so this converter emits the
@@ -36,22 +43,11 @@ import os
 import re
 import sys
 
-# Minimal ISO2 -> country name map for the codes the crawler's region heuristic and
-# cities.txt commonly produce; unknown codes pass through as-is.
-ISO2_TO_NAME = {
-    'US': 'United States', 'GB': 'United Kingdom', 'UK': 'United Kingdom',
-    'DE': 'Germany', 'FR': 'France', 'IT': 'Italy', 'ES': 'Spain', 'NL': 'Netherlands',
-    'JP': 'Japan', 'KR': 'South Korea', 'CN': 'China', 'TW': 'Taiwan', 'HK': 'Hong Kong',
-    'IN': 'India', 'BD': 'Bangladesh', 'PK': 'Pakistan', 'TH': 'Thailand', 'VN': 'Vietnam',
-    'ID': 'Indonesia', 'PH': 'Philippines', 'MY': 'Malaysia', 'SG': 'Singapore',
-    'CA': 'Canada', 'MX': 'Mexico', 'BR': 'Brazil', 'AR': 'Argentina', 'CL': 'Chile',
-    'AU': 'Australia', 'NZ': 'New Zealand', 'RU': 'Russia', 'TR': 'Turkey',
-    'EG': 'Egypt', 'ZA': 'South Africa', 'NG': 'Nigeria', 'KE': 'Kenya',
-    'PL': 'Poland', 'CZ': 'Czechia', 'AT': 'Austria', 'CH': 'Switzerland',
-    'BE': 'Belgium', 'SE': 'Sweden', 'NO': 'Norway', 'DK': 'Denmark', 'FI': 'Finland',
-    'PT': 'Portugal', 'GR': 'Greece', 'IE': 'Ireland', 'HU': 'Hungary', 'RO': 'Romania',
-    'UA': 'Ukraine', 'IL': 'Israel', 'AE': 'United Arab Emirates', 'SA': 'Saudi Arabia',
-}
+# The geocoder lives with the crawler; this script is run as scripts/<name>.py.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'crawler'))
+from gazetteer import Gazetteer  # noqa: E402
+
+UNKNOWN_TIME_OF_DAY = -1
 
 MAPPING_HEADER = [
     'id', 'city', 'state', 'country', 'iso3', 'continent', 'lat', 'lon', 'gmp',
@@ -87,8 +83,41 @@ def parse_duration_seconds(hms):
 
 
 def time_of_day_to_flag(value):
-    """morning/afternoon -> 0 (day); evening/night -> 1; unknown/other -> 0."""
-    return 1 if str(value).strip().lower() in ('evening', 'night') else 0
+    """day/morning/afternoon -> 0; evening/night -> 1; unknown -> -1 (never guessed)."""
+    value = str(value or '').strip().lower()
+    if value in ('evening', 'night'):
+        return 1
+    if value in ('day', 'morning', 'afternoon'):
+        return 0
+    return UNKNOWN_TIME_OF_DAY
+
+
+def format_number(value):
+    """Match the native mapping.csv style for populations ('2600000.0'); '' for unknown."""
+    return str(float(value)) if value else ''
+
+
+def geocode_row(entry, cc, gazetteer, names_by_iso3):
+    """Fill the location columns of a row this script created. Returns a warning or None."""
+    country = gazetteer.country(cc) if cc else None
+    if country:
+        native_name, native_continent = names_by_iso3.get(country.iso3, (None, None))
+        entry['country'] = native_name or country.name
+        entry['iso3'] = country.iso3
+        entry['continent'] = native_continent or country.continent
+        entry['population_country'] = format_number(country.population)
+    if not cc:
+        # Without a country the name alone is too ambiguous to place (see gazetteer.py).
+        return f"no country code for '{entry['city']}'; location columns left blank"
+    city = gazetteer.resolve_city(entry['city'], cc)
+    if not city:
+        return f"could not geocode '{entry['city']}' ({cc}); lat/lon left blank"
+    entry['lat'], entry['lon'] = city.latitude, city.longitude
+    entry['population_city'] = format_number(city.population)
+    if city.ambiguous:
+        return (f"'{entry['city']}' is ambiguous within {city.country_code}; used GeoNames "
+                f"{city.geonameid} ({city.name}, pop {city.population:,}) - check lat/lon")
+    return None
 
 
 def published_to_upload_date(published_at):
@@ -126,6 +155,34 @@ def parse_nested(raw):
         return []
     items = re.split(r'\]\s*,\s*\[', inner)
     return ['[' + item.strip().lstrip('[').rstrip(']') + ']' for item in items if item.strip()]
+
+
+CHANNEL_ID_RE = re.compile(r'/channel/(UC[\w-]{22})')
+
+
+def channel_id_from_row(row):
+    """YouTube channel ID (UC...) for a discovery row, or 'unknown'.
+
+    The native mapping.csv 'channel' list holds channel IDs (99% of entries), not
+    display names. Names can also contain commas, which would split an unquoted
+    "[a,b]" list and misalign it with 'videos'. The ID is parsed from channel_url.
+    """
+    explicit = (row.get('channel_id') or '').strip()
+    if re.fullmatch(r'UC[\w-]{22}', explicit):
+        return explicit
+    m = CHANNEL_ID_RE.search(row.get('channel_url') or '')
+    return m.group(1) if m else 'unknown'
+
+
+def write_csv_atomic(path, fieldnames, rows):
+    """Write a CSV via a temp file + os.replace, so a crash mid-write cannot leave
+    PedX-Insight's mapping files truncated."""
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, path)
 
 
 def read_csv_rows(path):
@@ -172,11 +229,18 @@ def main():
     # New videos append to the FIRST row of their city; row order is preserved verbatim.
     mapping_rows = []
     city_first_row = {}
+    names_by_iso3 = {}  # keep the native file's country/continent spelling for new rows
     if args.append and os.path.exists(args.out_mapping):
         mapping_rows = read_csv_rows(args.out_mapping)
         for i, r in enumerate(mapping_rows):
             city_first_row.setdefault(r.get('city', ''), i)
             known_ids.update(parse_bracketed(r.get('videos')))
+            if r.get('iso3') and r.get('country'):
+                names_by_iso3.setdefault(r['iso3'], (r['country'], r.get('continent') or None))
+    gazetteer = Gazetteer()
+    if not gazetteer.available:
+        print("Warning: geonamescache is not installed; new mapping.csv rows get no lat/lon/iso3.")
+    geo_warnings = []
 
     converted = deduped = bad = 0
 
@@ -198,9 +262,10 @@ def main():
         tod = time_of_day_to_flag(row.get('time_of_day'))
         end_sec = parse_duration_seconds(row.get('end_time'))
         upload = published_to_upload_date(row.get('published_at'))
-        channel = (row.get('channel_name') or '').strip()
+        channel = channel_id_from_row(row)
         cc = (row.get('country_code') or row.get('region_code') or '').strip().upper()
-        country = ISO2_TO_NAME.get(cc, cc if cc and cc != 'UNKNOWN' else '')
+        if cc == 'UNKNOWN':
+            cc = ''
 
         one_each_rows.append({
             'id': next_id, 'name': name, 'city': city, 'video': vid,
@@ -214,12 +279,15 @@ def main():
         if row_idx is None:
             new_row = {col: '' for col in MAPPING_HEADER}
             new_row['city'] = city
+            warning = geocode_row(new_row, cc, gazetteer, names_by_iso3)
+            if warning:
+                geo_warnings.append(warning)
+            if not new_row['country'] and cc:
+                new_row['country'] = cc  # unknown to GeoNames: pass the code through
             mapping_rows.append(new_row)
             row_idx = len(mapping_rows) - 1
             city_first_row[city] = row_idx
         entry = mapping_rows[row_idx]
-        if country and not entry.get('country'):
-            entry['country'] = country
         # Native formats: videos/upload_date/channel are FLAT lists ([a,b,...]);
         # time_of_day/start_time/end_time are NESTED ([[0],[1],...]).
         entry.setdefault('_videos', parse_bracketed(entry.get('videos')))
@@ -235,7 +303,7 @@ def main():
         entry['_start'].append('[0]')
         entry['_end'].append(f'[{end_sec if end_sec is not None else 0}]')
         entry['_upload'].append(str(upload))
-        entry['_channel'].append(channel or 'unknown')
+        entry['_channel'].append(channel)
         # vehicle_type/fps_list are analysis-derived and unknown to the crawler, but they
         # are aligned element-for-element with 'videos'. Extend them only when the row
         # already has them populated (crawler-only rows keep them blank), padding with
@@ -249,10 +317,7 @@ def main():
         converted += 1
 
     # --- Write mapping_one_each.csv ---
-    with open(args.out_mapping_one_each, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=MAPPING_ONE_EACH_HEADER, extrasaction='ignore')
-        w.writeheader()
-        w.writerows(one_each_rows)
+    write_csv_atomic(args.out_mapping_one_each, MAPPING_ONE_EACH_HEADER, one_each_rows)
 
     # --- Write mapping.csv (original row order preserved; untouched rows verbatim) ---
     existing_num_ids = [int(r['id']) for r in mapping_rows
@@ -278,16 +343,15 @@ def main():
                 entry['vehicle_type'] = bracketed(vtype)
             if fps:
                 entry['fps_list'] = bracketed(fps)
-    with open(args.out_mapping, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=MAPPING_HEADER, extrasaction='ignore')
-        w.writeheader()
-        w.writerows(mapping_rows)
+    write_csv_atomic(args.out_mapping, MAPPING_HEADER, mapping_rows)
 
     print(f"Converted {converted} videos ({deduped} duplicates skipped, {bad} bad rows)")
     print(f"Wrote {len(one_each_rows)} rows -> {args.out_mapping_one_each}")
     print(f"Wrote {len(mapping_rows)} city rows ({touched} touched) -> {args.out_mapping}")
-    print("Note: mapping.csv socio-economic columns (lat/lon, population, ...) are left "
-          "blank — they come from external enrichment, not the crawler.")
+    for warning in geo_warnings:
+        print(f"Geocoding: {warning}")
+    print("Note: new mapping.csv rows get location columns from GeoNames; socio-economic "
+          "columns (gmp, gini, traffic_index, ...) are left blank for external enrichment.")
 
 
 if __name__ == '__main__':

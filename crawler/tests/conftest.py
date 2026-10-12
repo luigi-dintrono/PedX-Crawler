@@ -13,6 +13,10 @@ import pytest
 
 CRAWLER_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = CRAWLER_DIR.parent
+# The crawler imports its sibling modules (filter_common, gazetteer, ...) by name, as
+# it does when run as `python crawler/pedx-crawler.py`.
+if str(CRAWLER_DIR) not in sys.path:
+    sys.path.insert(0, str(CRAWLER_DIR))
 
 
 def _stub(name, **attrs):
@@ -55,22 +59,46 @@ def bridge():
     return _load_path(REPO_ROOT / 'scripts' / 'discovery_to_mapping.py', 'bridge_under_test')
 
 
+class _FakeBoxes:
+    def __init__(self, class_ids):
+        self.cls = types.SimpleNamespace(tolist=lambda: list(class_ids))
+
+
+class _FakeYOLOResult:
+    names = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck',
+             9: 'traffic light', 11: 'stop sign', 56: 'chair'}
+
+    def __init__(self, class_ids):
+        self.boxes = _FakeBoxes(class_ids)
+
+
+class FakeYOLO:
+    """Returns pre-programmed detections (class ids) per frame, in call order."""
+    script = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    def __call__(self, paths, **kwargs):
+        return [_FakeYOLOResult(FakeYOLO.script[i] if i < len(FakeYOLO.script) else [])
+                for i in range(len(paths))]
+
+
 @pytest.fixture
 def yolo_filter():
-    """The YOLO filter module, with ultralytics stubbed (model load fails -> None)."""
-    def _raise(*a, **k):
-        raise RuntimeError("stubbed YOLO: no model in tests")
-    _stub('ultralytics', YOLO=_raise)
+    """The YOLO filter module, with ultralytics stubbed by FakeYOLO."""
+    FakeYOLO.script = []
+    _stub('ultralytics', YOLO=FakeYOLO)
     return _load('video_quality_filter_yolo.py', 'yolo_under_test')
 
 
 @pytest.fixture
 def internvl3_filter():
-    """The InternVL3 filter module, with torch/transformers/PIL/torchvision stubbed."""
-    torch = _stub('torch',
-                  bfloat16='bfloat16', float32='float32',
-                  cuda=types.SimpleNamespace(is_available=lambda: False),
-                  backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False)))
+    """The InternVL3 filter module, with torch/transformers stubbed (no weights)."""
+    _stub('torch',
+          bfloat16='bfloat16', float32='float32',
+          cuda=types.SimpleNamespace(is_available=lambda: False),
+          backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False)))
 
     class _FakeModel:
         def eval(self):
@@ -80,16 +108,14 @@ def internvl3_filter():
             self.device = device
             return self
 
+    class _FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [len(text.strip())]  # deterministic: every 'yes' -> 3, every 'no' -> 2
+
     _stub('transformers',
-          AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: object()),
-          AutoModel=types.SimpleNamespace(from_pretrained=lambda *a, **k: _FakeModel()))
-    _stub('PIL', Image=types.SimpleNamespace(open=lambda *a, **k: None))
-    _stub('PIL.Image', open=lambda *a, **k: None)
-    tv = _stub('torchvision')
-    _stub('torchvision.transforms', Compose=lambda *a, **k: None, Resize=object,
-          ToTensor=object, Normalize=object, Lambda=object)
-    tv.transforms = sys.modules['torchvision.transforms']
-    _stub('torchvision.transforms.functional', InterpolationMode=types.SimpleNamespace(BICUBIC='bicubic'))
+          AutoProcessor=types.SimpleNamespace(
+              from_pretrained=lambda *a, **k: types.SimpleNamespace(tokenizer=_FakeTokenizer())),
+          AutoModelForImageTextToText=types.SimpleNamespace(from_pretrained=lambda *a, **k: _FakeModel()))
     return _load('video_quality_filter_internvl3.py', 'internvl3_under_test')
 
 
@@ -104,13 +130,17 @@ class _Req:
 
 
 class _FakeSearch:
+    """search.list keyed by (q, pageToken); every call's params are recorded."""
+
     def __init__(self, table, counter):
         self.table, self.counter = table, counter
         self.last_params = None
+        self.calls = []
 
     def list(self, **params):
         self.counter['search'] += 1
         self.last_params = params
+        self.calls.append(params)
         return _Req(self.table.get((params['q'], params.get('pageToken')), {'items': []}))
 
 
@@ -138,10 +168,11 @@ class FakeYouTube:
         return self._videos
 
 
-def make_search_item(vid, title="pedestrian crossing at intersection"):
+def make_search_item(vid, title="Driving in London 4K"):
     return {'id': {'videoId': vid},
             'snippet': {'title': title, 'channelTitle': f'ch-{vid}',
                         'channelId': f'cid-{vid}', 'publishedAt': '2026-06-01T00:00:00Z',
+                        'liveBroadcastContent': 'none',
                         'thumbnails': {'high': {'url': f'https://i.ytimg.com/{vid}.jpg'}}}}
 
 
@@ -150,6 +181,10 @@ DISCOVERY_FIELDS = [
     'region_code', 'channel_name', 'channel_url', 'published_at', 'country_code',
     'duration_seconds', 'view_count', 'like_count', 'comment_count', 'thumbnail_url',
     'latitude', 'longitude',
+    'channel_id', 'definition', 'projection', 'default_audio_language', 'live_broadcast',
+    'time_of_day_source', 'country_code_source',
+    'search_profile', 'search_query', 'search_language', 'search_duration', 'search_rank',
+    'filter_backend', 'filter_score', 'run_id',
 ]
 
 
@@ -175,11 +210,21 @@ def discovery_row(vid, city='London', cc='GB', time_of_day='unknown',
             'published_at': published_at, 'country_code': cc}
 
 
-def make_details(vid, duration='PT2M30S', views='1234', lat=None, lon=None):
+def make_details(vid, duration='PT25M', views='1234', lat=None, lon=None, title=None,
+                 live='none', projection='rectangular', definition='hd', tags=None,
+                 description=''):
     rec = {}
     if lat is not None and lon is not None:
         rec = {'location': {'latitude': lat, 'longitude': lon}}
+    snippet = {'title': title or 'Driving in London 4K', 'channelTitle': f'ch-{vid}',
+               'channelId': f'UC{vid:0>22}'[:24], 'publishedAt': '2026-06-01T00:00:00Z',
+               'liveBroadcastContent': live, 'description': description,
+               'thumbnails': {'high': {'url': f'https://i.ytimg.com/{vid}.jpg'}}}
+    if tags:
+        snippet['tags'] = tags
     return {'id': vid,
-            'contentDetails': {'duration': duration},
+            'snippet': snippet,
+            'contentDetails': {'duration': duration, 'definition': definition,
+                               'projection': projection},
             'statistics': {'viewCount': views, 'likeCount': '10', 'commentCount': '2'},
             'recordingDetails': rec}

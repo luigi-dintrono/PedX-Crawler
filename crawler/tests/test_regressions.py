@@ -4,16 +4,16 @@ import csv
 import pytest
 from conftest import FakeYouTube, make_search_item, make_details
 
-TERM = "London street crossing pedestrian"
+TERM = "London driving 4K"
 
 
-def _discovery(pedx, table, details, quality_filter=None):
-    d = pedx.YouTubeDiscovery.__new__(pedx.YouTubeDiscovery)
-    d.youtube = FakeYouTube(table, details)
-    d.quota_tracker = pedx.QuotaTracker()
-    d.quality_filter = quality_filter
-    d.last_stats = {}
-    return d
+def _discovery(pedx, table, details):
+    return pedx.YouTubeDiscovery(youtube=FakeYouTube(table, details))
+
+
+def _search(d, pedx, max_results=10, seen_ids=None):
+    stream = pedx.SearchStream(query=TERM, language='en', duration='any')
+    return d.search_city('London', [stream], max_results, '2020-01-01T00:00:00Z', seen_ids=seen_ids)
 
 
 def _row(vid):
@@ -30,7 +30,7 @@ def test_missing_details_leaves_videos_unseen(pedx):
     table = {(TERM, None): {'items': [make_search_item('v1'), make_search_item('v2')]}}
     d = _discovery(pedx, table, {})  # no details for anyone
     seen = set()
-    res = d.search_videos('London', max_results=10, use_single_search=True, seen_ids=seen)
+    res = _search(d, pedx, seen_ids=seen)
     assert res == []
     assert seen == set()  # nothing burned -> discoverable on a later run
 
@@ -41,7 +41,7 @@ def test_surplus_page_ids_not_marked_seen(pedx):
     details = {f'v{i}': make_details(f'v{i}') for i in range(1, 6)}
     d = _discovery(pedx, table, details)
     seen = set()
-    res = d.search_videos('London', max_results=2, use_single_search=True, seen_ids=seen)
+    res = _search(d, pedx, max_results=2, seen_ids=seen)
     assert [r['id'] for r in res] == ['v1', 'v2']
     assert seen == {'v1', 'v2'}  # v3..v5 NOT burned
 
@@ -58,7 +58,7 @@ def test_quota_exceeded_in_details_propagates(pedx):
     d = _discovery(pedx, {(TERM, None): {'items': [make_search_item('v1')]}}, {})
     d.youtube._videos = _QuotaVideos()
     with pytest.raises(pedx.HttpError):
-        d.search_videos('London', max_results=5, use_single_search=True)
+        _search(d, pedx, max_results=5)
 
 
 def test_append_incompatible_header_falls_back(pedx, tmp_path):

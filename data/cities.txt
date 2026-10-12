@@ -1,5 +1,9 @@
-# Road-Crossing Video Discovery - Cities List
-# One city per line, comments start with #
-# Format: CityName or CityName,CountryCode
+# Cities to crawl. One per line:  City  |  City,CC  |  City,CC,Local name
+#   CC          ISO 3166-1 alpha-2 country code. Strongly recommended: names like
+#               "Portland" or "London" are ambiguous without it (the crawler warns).
+#   Local name  Used in non-English search queries (e.g. Tokyo,JP,東京).
+# Lines starting with # are comments.
 
-London
+London,GB
+Tokyo,JP,東京
+New York,US
