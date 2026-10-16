@@ -24,7 +24,7 @@ DECISION_FIELDS = [
     'video_id', 'title', 'channel_id', 'published_at', 'duration_seconds', 'definition',
     'projection', 'live_broadcast', 'default_audio_language',
     'stage', 'decision', 'reason', 'score', 'backend', 'model', 'threshold',
-    'frame_timestamps', 'frame_scores', 'frame_brightness', 'time_of_day',
+    'frame_source', 'frame_timestamps', 'frame_scores', 'frame_brightness', 'time_of_day',
 ]
 
 

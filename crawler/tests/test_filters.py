@@ -105,7 +105,8 @@ def test_time_of_day_from_title(title, expected):
 
 
 @pytest.mark.parametrize("lumas,expected", [
-    ([20, 30, 40], 'night'), ([120, 140, 90], 'day'), ([60, 70, 75], 'unknown'), ([], 'unknown'),
+    ([20, 30, 40], 'night'), ([120, 140, 90], 'day'), ([60, 80, 90], 'unknown'), ([], 'unknown'),
+    ([64, 65, 66], 'night'), ([94, 95, 96], 'day'),          # the calibrated cut-offs: 65 / 95
 ])
 def test_time_of_day_from_brightness(lumas, expected):
     assert fc.time_of_day_from_brightness(lumas) == expected
@@ -221,18 +222,28 @@ def test_yolo_classify_frame(yolo_filter, counts, expected):
     assert yolo_filter.classify_frame(counts) == expected
 
 
-def test_yolo_decision_requires_street_and_pedestrian(yolo_filter, tmp_path):
+def test_yolo_decision_is_street_scene_fraction_by_default(yolo_filter, tmp_path):
     from conftest import FakeYOLO
     frames = _frames(tmp_path, 4, shade=150)
     f = yolo_filter.VideoQualityFilter(sampler=_FakeSampler(frames))
     FakeYOLO.script = [[2, 2], [2, 0], [56], [7]]          # car, car+person, chair, truck
     r = f.check(_video())
     assert r.accepted and r.score == 0.75
+    FakeYOLO.script = [[2], [2], [2], [2]]                  # street, nobody on it: fine by default
+    assert f.check(_video()).accepted
+    FakeYOLO.script = [[0, 0], [0], [56], []]               # people, no street
+    assert not f.check(_video()).accepted
+
+
+def test_yolo_require_person_option(yolo_filter, tmp_path):
+    from conftest import FakeYOLO
+    frames = _frames(tmp_path, 4, shade=150)
+    f = yolo_filter.VideoQualityFilter(sampler=_FakeSampler(frames), require_person=True)
     FakeYOLO.script = [[2], [2], [2], [2]]                  # street but nobody on it
     r = f.check(_video())
     assert not r.accepted and 'no person' in r.reason
-    FakeYOLO.script = [[0, 0], [0], [56], []]               # people, no street
-    assert not f.check(_video()).accepted
+    FakeYOLO.script = [[2, 0], [2], [2], [2]]               # one street frame has a person
+    assert f.check(_video()).accepted
 
 
 def test_yolo_model_load_failure_raises(yolo_filter, tmp_path, monkeypatch):

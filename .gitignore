@@ -45,3 +45,9 @@ ENV/
 *.log
 tmp/
 crawler/tmp/
+
+# Model weights (Ultralytics downloads yolo26n.pt into the current directory on first use)
+*.pt
+
+# uv / virtualenvs
+.venv/

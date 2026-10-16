@@ -54,12 +54,16 @@ TITLE_TIME_OF_DAY = (
     ('afternoon', ('afternoon', 'midday', 'noon')),
 )
 
-# Frame-brightness day/night thresholds (mean luma, 0-255). Heuristic: night footage of
-# lit streets typically averages well under 55, daylight (incl. overcast) above 80.
-# Between the two the label stays 'unknown'. Per-frame values are logged so the
-# thresholds can be recalibrated against labelled data.
-NIGHT_MAX_LUMA = 55.0
-DAY_MIN_LUMA = 80.0
+# Frame-brightness day/night thresholds (median over frames of mean luma, 0-255).
+# Calibrated on 111 YouTube city-driving videos labelled from unambiguous title cues
+# ("night", "morning", ...; weak labels) using their thumbnail frames: night-titled videos
+# had median brightness 49 (quartiles 36-64), day-titled 120 (110-140). Lit cities at night
+# are not very dark, so the night cut-off is higher than intuition suggests. With these
+# values 79% of night-titled videos were labelled night (4% mislabelled day) and 91% of
+# day-titled day (3% mislabelled night); the rest fall in the 'unknown' band. Re-fit the
+# two numbers from decisions.csv (`frame_brightness`) for other kinds of footage.
+NIGHT_MAX_LUMA = 65.0
+DAY_MIN_LUMA = 95.0
 
 
 def _uses_word_boundaries(keyword: str) -> bool:
@@ -110,11 +114,52 @@ def time_of_day_from_brightness(lumas: Sequence[float]) -> str:
     return 'unknown'
 
 
+BAR_MAX_LUMA = 6  # an edge row/column whose brightest pixel is <= this is a black bar
+
+
+def strip_black_bars(gray):
+    """Crop letterbox / pillarbox bars from the edges of a grayscale PIL image.
+
+    A bar is an edge row/column that is near-pure black throughout (brightest pixel <=
+    BAR_MAX_LUMA), and bars are only removed when the opposite side has one of similar
+    thickness - real letterboxing is centred, whereas a dark night scene is rarely black
+    to the same depth at both edges (sensor noise alone lifts a full row above the
+    threshold). At most a quarter of each dimension per side is removed, so a dark frame
+    is never cropped down to its few bright pixels."""
+    w, h = gray.size
+
+    def bar_row(y):
+        return gray.crop((0, y, w, y + 1)).getextrema()[1] <= BAR_MAX_LUMA
+
+    def bar_col(x):
+        return gray.crop((x, 0, x + 1, h)).getextrema()[1] <= BAR_MAX_LUMA
+
+    top = 0
+    while top < h // 4 and bar_row(top):
+        top += 1
+    bottom = h
+    while bottom > h - h // 4 and bar_row(bottom - 1):
+        bottom -= 1
+    left = 0
+    while left < w // 4 and bar_col(left):
+        left += 1
+    right = w
+    while right > w - w // 4 and bar_col(right - 1):
+        right -= 1
+    if abs(top - (h - bottom)) > max(2, h // 50):    # not symmetric: a dark scene, not bars
+        top, bottom = 0, h
+    if abs(left - (w - right)) > max(2, w // 50):
+        left, right = 0, w
+    if right - left < 1 or bottom - top < 1:
+        return gray
+    return gray.crop((left, top, right, bottom))
+
+
 def frame_luma(path: str) -> float:
-    """Mean luma (ITU-R 601, 0-255) of an image file."""
+    """Mean luma (ITU-R 601, 0-255) of an image file, excluding letterbox bars."""
     from PIL import Image, ImageStat
     with Image.open(path) as img:
-        return float(ImageStat.Stat(img.convert('L')).mean[0])
+        return float(ImageStat.Stat(strip_black_bars(img.convert('L'))).mean[0])
 
 
 def parse_hms(value: str) -> Optional[int]:
@@ -245,7 +290,7 @@ class AccessDeniedError(SamplingError):
 @dataclass
 class Frame:
     path: str
-    timestamp: float
+    timestamp: Optional[float]  # seconds into the video; None when the source does not say
 
 
 def detect_js_runtime() -> Optional[str]:
@@ -266,6 +311,8 @@ class FrameSampler:
     a localhost range-chunking proxy (see video_access.py for why ffmpeg cannot read
     YouTube's URLs directly). Only the index and the fragments around each timestamp
     are transferred."""
+
+    source = 'stream'
 
     def __init__(self, temp_dir: str = 'tmp', n_frames: int = 5, max_height: int = 720,
                  cookies_file: Optional[str] = None, js_runtime: Optional[str] = 'auto',
@@ -333,16 +380,119 @@ class FrameSampler:
                 print(f"    Warning: could not delete temp file {path}: {e}")
 
 
+THUMBNAIL_NAMES = ('mq1', 'mq2', 'mq3')  # 320x180 auto-generated frames
+THUMBNAIL_URL = 'https://i.ytimg.com/vi/{video_id}/{name}.jpg'
+
+
+class ThumbnailSampler:
+    """Frames from YouTube's auto-generated thumbnails (`mq1`, `mq2`, `mq3`).
+
+    These are public 320x180 stills taken from the video itself (commonly documented as
+    roughly the 25%, 50% and 75% marks; YouTube does not guarantee the positions), served
+    from i.ytimg.com with no token, login, yt-dlp or ffmpeg. Trade-offs versus
+    FrameSampler: only 3 frames, low resolution (small pedestrians can be missed),
+    positions unknown (timestamps are None), but they work when the stream is refused.
+    `decisions.csv` records `frame_source` for every verdict."""
+
+    source = 'thumbnails'
+
+    def __init__(self, temp_dir: str = 'tmp', names: Sequence[str] = THUMBNAIL_NAMES,
+                 timeout: int = 20, min_frames: int = 2, session=None):
+        import requests
+        self.temp_dir = Path(temp_dir)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.names = tuple(names)
+        self.timeout = timeout
+        self.min_frames = min_frames
+        self.session = session or requests.Session()
+
+    def sample(self, video_id: str, url: str, duration: Optional[float]) -> List[Frame]:
+        import requests
+        frames: List[Frame] = []
+        last_error = ''
+        for name in self.names:
+            try:
+                r = self.session.get(THUMBNAIL_URL.format(video_id=video_id, name=name),
+                                     timeout=self.timeout)
+            except requests.RequestException as e:
+                last_error = str(e)
+                continue
+            if r.status_code != 200 or not r.content:
+                last_error = f"HTTP {r.status_code} for {name}"
+                continue
+            path = self.temp_dir / f'{video_id}.{name}.jpg'
+            path.write_bytes(r.content)
+            frames.append(Frame(str(path), None))
+        if len(frames) < self.min_frames:
+            raise SamplingError(f"only {len(frames)} of {len(self.names)} thumbnail frames "
+                                f"available ({last_error or 'none returned'})")
+        return frames
+
+    def cleanup(self, video_id: str) -> None:
+        for path in self.temp_dir.glob(f'{video_id}.*'):
+            try:
+                path.unlink()
+            except OSError as e:
+                print(f"    Warning: could not delete temp file {path}: {e}")
+
+
+class AutoSampler:
+    """Try the full-stream sampler; once YouTube refuses the media request, use thumbnails
+    for the rest of the run (re-trying a blocked stream per video would cost ~15 s each).
+    `last_source` says which one produced the most recent frames."""
+
+    def __init__(self, stream: FrameSampler, thumbnails: ThumbnailSampler):
+        self.stream = stream
+        self.thumbnails = thumbnails
+        self.stream_blocked = False
+        self.last_source = ''
+
+    def sample(self, video_id: str, url: str, duration: Optional[float]) -> List[Frame]:
+        if not self.stream_blocked:
+            try:
+                frames = self.stream.sample(video_id, url, duration)
+                self.last_source = self.stream.source
+                return frames
+            except AccessDeniedError:
+                self.stream_blocked = True
+                self.stream.cleanup(video_id)
+                print("    Note: YouTube refused the media stream; using thumbnail frames "
+                      "(3 low-res frames) for the rest of this run. For full-resolution frames "
+                      "spread across the video, supply --ytdlp-cookies or a PO-token plugin.")
+        frames = self.thumbnails.sample(video_id, url, duration)
+        self.last_source = self.thumbnails.source
+        return frames
+
+    def cleanup(self, video_id: str) -> None:
+        self.stream.cleanup(video_id)
+        self.thumbnails.cleanup(video_id)
+
+
+FRAME_SOURCES = ('auto', 'stream', 'thumbnails')
+
+
+def make_sampler(frame_source: str, temp_dir: str = 'tmp', n_frames: int = 5, **stream_kwargs):
+    """Build the frame sampler for --frame-source (auto | stream | thumbnails)."""
+    if frame_source not in FRAME_SOURCES:
+        raise ValueError(f"frame_source must be one of {FRAME_SOURCES}, got {frame_source!r}")
+    if frame_source == 'thumbnails':
+        return ThumbnailSampler(temp_dir=temp_dir)
+    stream = FrameSampler(temp_dir=temp_dir, n_frames=n_frames, **stream_kwargs)
+    if frame_source == 'stream':
+        return stream
+    return AutoSampler(stream, ThumbnailSampler(temp_dir=temp_dir))
+
+
 class VisualFilter:
     """Base class for stage-2 backends. Subclasses implement score_frames()."""
 
     backend = 'base'
     model_name = ''
 
-    def __init__(self, threshold: float = 0.5, sampler: Optional[FrameSampler] = None,
-                 temp_dir: str = 'tmp', n_frames: int = 5, **sampler_kwargs):
+    def __init__(self, threshold: float = 0.5, sampler=None, temp_dir: str = 'tmp',
+                 n_frames: int = 5, frame_source: str = 'auto', **sampler_kwargs):
         self.threshold = threshold
-        self.sampler = sampler or FrameSampler(temp_dir=temp_dir, n_frames=n_frames, **sampler_kwargs)
+        self.sampler = sampler or make_sampler(frame_source, temp_dir, n_frames, **sampler_kwargs)
 
     def score_frames(self, paths: List[str]) -> Tuple[List[float], List[Dict[str, Any]]]:
         """Return a score in [0, 1] per frame plus per-frame audit details."""
@@ -371,6 +521,7 @@ class VisualFilter:
             self.sampler.cleanup(video_id)
         accepted, score, reason = self.decide(scores, frame_details)
         details = {
+            'frame_source': getattr(self.sampler, 'last_source', '') or getattr(self.sampler, 'source', ''),
             'frame_timestamps': [f.timestamp for f in frames],
             'frame_scores': [round(s, 3) for s in scores],
             'frame_brightness': lumas,

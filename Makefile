@@ -10,7 +10,7 @@ OUTPUT ?= data/outputs/discovery.csv
 DISCOVERY ?= data/outputs/discovery.csv
 INSIGHT ?= ../PedX-Insight
 
-.PHONY: help install install-yolo install-internvl3 install-eval install-dev setup \
+.PHONY: help install install-yolo install-internvl3 install-eval install-dev install-locked setup \
         run run-verbose dry-run run-yolo run-internvl3 smoke test test-unit \
         bridge label-sample evaluate clean clean-temp ci-run
 
@@ -21,6 +21,7 @@ help:
 	@echo "  install-internvl3  - core + InternVL3 visual filter"
 	@echo "  install-eval       - core + filter-evaluation script deps"
 	@echo "  install-dev        - core + test deps (pytest)"
+	@echo "  install-locked     - exact versions from uv.lock (needs uv): core + test deps"
 	@echo "  setup              - copy .env.example to .env (add your YouTube API key)"
 	@echo "  dry-run            - print the search plan + quota estimate, no API calls"
 	@echo "  run                - crawl with the metadata filter (profile: dashcam)"
@@ -49,6 +50,12 @@ install-eval:
 
 install-dev:
 	$(PYTHON) -m pip install -e ".[dev]"
+
+# Reproducible install of the committed lock file (https://docs.astral.sh/uv/).
+# Fine for tests and crawling; for the ML extras on Windows/CUDA prefer pip with a CUDA torch
+# build first: the lock pins the PyPI torch wheel, which is CPU-only on Windows.
+install-locked:
+	uv sync --locked --extra dev
 
 setup:
 	@if [ ! -f .env ]; then \

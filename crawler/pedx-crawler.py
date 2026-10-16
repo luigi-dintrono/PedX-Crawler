@@ -56,7 +56,7 @@ CSV_FIELDNAMES = [
     'channel_id', 'definition', 'projection', 'default_audio_language', 'live_broadcast',
     'time_of_day_source', 'country_code_source',
     'search_profile', 'search_query', 'search_language', 'search_duration', 'search_rank',
-    'filter_backend', 'filter_score', 'run_id',
+    'filter_backend', 'filter_score', 'run_id', 'frame_source',
 ]
 
 SEARCH_PAGE_SIZE = 50  # search.list maximum; a page costs 100 units whatever its size
@@ -315,6 +315,7 @@ class YouTubeDiscovery:
             result = self._judge(video)
 
             self._track_visual_errors(result)
+            video['frame_source'] = result.details.get('frame_source', '')
             frames_tod = result.details.get('time_of_day', 'unknown')
             if frames_tod != 'unknown':
                 video['time_of_day'], video['time_of_day_source'] = frames_tod, 'frames'
@@ -390,6 +391,7 @@ class YouTubeDiscovery:
             'frame_scores': details.get('frame_scores', ''),
             'frame_brightness': details.get('frame_brightness', ''),
             'time_of_day': video['time_of_day'],
+            'frame_source': details.get('frame_source', ''),
         })
 
     def _build_video_data(self, c: Candidate, details: Dict[str, Any], city: str,
@@ -751,7 +753,12 @@ def build_parser() -> argparse.ArgumentParser:
     visual.add_argument('--filter-type', choices=['yolo', 'internvl3'], default='yolo', help='Legacy: backend for --enable-quality-filter')
     visual.add_argument('--enable-quality-filter', action='store_true', help='Legacy: enable the visual filter')
     visual.add_argument('--threshold', type=float, default=None, help='Acceptance threshold on the mean frame score (default 0.5)')
-    visual.add_argument('--frames', type=int, default=5, help='Frames sampled evenly across each video (default: 5)')
+    visual.add_argument('--frames', type=int, default=5, help='Frames sampled evenly across each video (default: 5; stream source only)')
+    visual.add_argument('--frame-source', choices=['auto', 'stream', 'thumbnails'], default='auto',
+                        help="Where frames come from: 'stream' = full-resolution frames spread across the video (needs cookies or a PO-token plugin), "
+                             "'thumbnails' = YouTube's 3 public 320x180 auto-generated frames (no token needed), 'auto' = stream, falling back to thumbnails once YouTube refuses it (default)")
+    visual.add_argument('--require-person', action='store_true',
+                        help='YOLO: also require a person in a street-scene frame (off by default: it rejected 64%% of curated videos)')
     visual.add_argument('--yolo-model', default='yolo26n.pt', help='Ultralytics YOLO checkpoint (default: yolo26n.pt)')
     visual.add_argument('--yolo-conf', type=float, default=0.25, help='YOLO detection confidence (default: 0.25)')
     visual.add_argument('--internvl3-model', default='OpenGVLab/InternVL3-8B-hf', help='InternVL3 -hf checkpoint (default: OpenGVLab/InternVL3-8B-hf)')
@@ -833,7 +840,8 @@ def main():
                      f"{len(negative)} blocked keywords, title-keyword gate "
                      f"{'on' if args.require_title_keywords else 'off'}"
                      + (f", max age {args.max_upload_months} months" if args.max_upload_months else ''))
-    filter_desc = (f"{filter_type} (threshold {threshold}, {args.frames} frames)" if enable_filter else 'disabled')
+    filter_desc = (f"{filter_type} (threshold {threshold}, frame source {args.frame_source}, up to {args.frames} stream frames)"
+                   if enable_filter else 'disabled')
 
     if args.dry_run:
         print("=== DRY RUN (no API calls, no quota spent) ===")
@@ -871,10 +879,11 @@ def main():
     visual_filter = None
     if enable_filter:
         filter_kwargs = {'threshold': threshold, 'temp_dir': args.temp_dir, 'n_frames': args.frames,
-                         'cookies_file': args.ytdlp_cookies,
+                         'cookies_file': args.ytdlp_cookies, 'frame_source': args.frame_source,
                          'js_runtime': None if args.ytdlp_js_runtime == 'none' else args.ytdlp_js_runtime}
         if filter_type == 'yolo':
-            filter_kwargs.update(yolo_model_path=args.yolo_model, conf=args.yolo_conf)
+            filter_kwargs.update(yolo_model_path=args.yolo_model, conf=args.yolo_conf,
+                                 require_person=args.require_person)
         else:
             filter_kwargs.update(model_name=args.internvl3_model, device=args.device)
         try:
@@ -908,6 +917,7 @@ def main():
             'visual_filter': filter_type if visual_filter else None,
             'visual_model': getattr(visual_filter, 'model_name', None),
             'threshold': threshold if visual_filter else None, 'frames': args.frames if visual_filter else None,
+            'frame_source': args.frame_source if visual_filter else None,
             'quota_limit': args.quota_limit,
         },
         'environment': environment_info(REPO_DIR, packages),

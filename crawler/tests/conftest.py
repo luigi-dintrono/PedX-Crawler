@@ -184,7 +184,7 @@ DISCOVERY_FIELDS = [
     'channel_id', 'definition', 'projection', 'default_audio_language', 'live_broadcast',
     'time_of_day_source', 'country_code_source',
     'search_profile', 'search_query', 'search_language', 'search_duration', 'search_rank',
-    'filter_backend', 'filter_score', 'run_id',
+    'filter_backend', 'filter_score', 'run_id', 'frame_source',
 ]
 
 

@@ -8,8 +8,11 @@ Ultralytics YOLO detector (YOLO26 by default) on them:
   * a frame is a *street scene* when it shows a road vehicle (car, bus, truck,
     motorcycle, bicycle), a traffic light or a stop sign;
   * the video score is the fraction of sampled frames that are street scenes;
-  * the video is accepted when score >= threshold (default 0.5) AND at least one
-    street-scene frame also contains a person (PedX-Insight analyses pedestrians).
+  * the video is accepted when score >= threshold (default 0.5);
+  * with require_person=True (--require-person) a street-scene frame must also contain
+    a person. This is OFF by default: on 195 curated PedX-Insight videos it cut
+    sensitivity from 87% to 36%, because a pedestrian appears in a few sampled frames of
+    only ~46% of long driving videos (see QUALITY_FILTER_README.md, "Validation").
 
 The old "two or more people" rule is gone: it accepted indoor vlogs. Class names are
 read from the model, so any checkpoint with COCO-style names works.
@@ -40,10 +43,11 @@ class VideoQualityFilter(VisualFilter):
     backend = 'yolo'
 
     def __init__(self, yolo_model_path: str = 'yolo26n.pt', conf: float = 0.25,
-                 threshold: float = 0.5, **kwargs):
+                 threshold: float = 0.5, require_person: bool = False, **kwargs):
         super().__init__(threshold=threshold, **kwargs)
         self.model_name = yolo_model_path
         self.conf = conf
+        self.require_person = require_person
         # Fail closed: a filter that silently skipped this stage would label an
         # unfiltered dataset as filtered.
         try:
@@ -68,7 +72,7 @@ class VideoQualityFilter(VisualFilter):
 
     def decide(self, scores, frame_details):
         accepted, score, reason = super().decide(scores, frame_details)
-        if accepted and not any(d.get('pedestrian') for d in frame_details):
+        if accepted and self.require_person and not any(d.get('pedestrian') for d in frame_details):
             return False, score, f"street scenes ({reason}) but no person in any street frame"
         return accepted, score, f"street-scene fraction: {reason}"
 

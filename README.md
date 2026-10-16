@@ -30,9 +30,11 @@ cities file ─► search streams ─► candidates ─► metadata filter ─�
 3. **Metadata filter** (always on) - rejects live streams, videos outside 4 min - 3 h, 360°
    video, `#shorts`, game footage / simulators, compilations, time-lapses and videos whose
    title says they are sped up (`3x Speed`). See [crawler/QUALITY_FILTER_README.md](crawler/QUALITY_FILTER_README.md).
-4. **Visual filter** (optional) - samples 5 frames spread across the video, scores them with
-   YOLO or InternVL3 and accepts or rejects. **Read [Visual filter access](#visual-filter-access)
-   first: it needs login cookies or a PO-token plugin to work on most videos.**
+4. **Visual filter** (optional) - scores frames with YOLO or InternVL3 and accepts or
+   rejects. Frames come from the full stream (5 frames spread across the video) when YouTube
+   serves it, otherwise automatically from YouTube's 3 public thumbnail frames - see
+   [Visual filter access](#visual-filter-access). Validation results are in
+   [crawler/QUALITY_FILTER_README.md](crawler/QUALITY_FILTER_README.md#validation).
 5. **Record** - every examined candidate is logged with its search provenance and verdict.
 
 ## Quick start
@@ -105,7 +107,9 @@ dashcam window keeps about 96% of the curated PedX-Insight videos (2.2% are shor
 | `--require-title-keywords` | Also require a profile keyword in the title or tags | off |
 | `--filter {none,yolo,internvl3}` | Visual filter backend | none |
 | `--threshold F` | Acceptance threshold on the mean frame score | 0.5 |
-| `--frames N` | Frames sampled across each video | 5 |
+| `--frame-source {auto,stream,thumbnails}` | `stream`: 5 full-resolution frames spread across the video (needs cookies or a PO-token plugin); `thumbnails`: YouTube's 3 public 320x180 frames (no token needed); `auto`: stream, falling back to thumbnails once YouTube refuses it | `auto` |
+| `--frames N` | Frames sampled across each video (stream source only) | 5 |
+| `--require-person` | YOLO only: also require a person in a street-scene frame (off by default: it rejected 64% of curated videos) | off |
 | `--yolo-model`, `--yolo-conf` | YOLO checkpoint and detection confidence | `yolo26n.pt`, 0.25 |
 | `--internvl3-model`, `--device` | InternVL3 `-hf` checkpoint and device | `OpenGVLab/InternVL3-8B-hf`, `auto` |
 | `--ytdlp-cookies FILE` | `cookies.txt` for frame sampling | - |
@@ -124,32 +128,39 @@ a min-max estimate.
 
 ## Visual filter access
 
-Frame sampling reads a few seconds from several points in each video. **In October 2026,
-on a machine with no cookies and no PO-token plugin, yt-dlp could reach only the first
-~6 MB of the one video tested, and any seek deeper into the stream failed with HTTP 403**
-(YouTube's current player clients appear to require a PO token or a logged-in session for
-the rest). yt-dlp's own full download of that video failed the same way, so
-PedX-Insight's `run.py` downloads may be subject to the same requirement. This was
-observed on a single video and network, not surveyed.
+Reading frames from the video stream is the best source (full resolution, spread across the
+whole video), but **in October 2026, on a machine with no cookies and no PO-token plugin,
+yt-dlp could reach only the first ~6 MB of the one video tested, and any seek deeper into
+the stream failed with HTTP 403** (YouTube's current player clients appear to require a PO
+token or a logged-in session for the rest). yt-dlp's own full download of that video failed
+the same way, so PedX-Insight's `run.py` downloads may be subject to the same requirement.
+This was observed on a single video and network, not surveyed.
 
 What the crawler does about it:
 
-* ffmpeg cannot read YouTube URLs directly (it sends open-ended range requests, which are
-  refused). Frames are read through a small localhost range-chunking proxy
-  ([crawler/video_access.py](crawler/video_access.py)), which works whenever the stream is accessible.
-* If YouTube refuses the media request, the visual check fails **closed** (the video is
-  not accepted) with a message naming the fix, and **the run aborts after
-  `--max-consecutive-errors` (default 5) failures in a row**, saving what it has.
+* **Thumbnail fallback (`--frame-source auto`, the default).** YouTube publishes three
+  auto-generated 320x180 frames per video (`mq1`-`mq3`, commonly documented as roughly the
+  25%, 50% and 75% marks; the positions are not guaranteed) at public `i.ytimg.com` URLs that
+  need no token, login, yt-dlp or ffmpeg. Once YouTube refuses the media stream, the rest
+  of the run uses them. They are low resolution (small pedestrians can be missed) and only
+  three, but they let the filters run anywhere, and the validation in
+  [crawler/QUALITY_FILTER_README.md](crawler/QUALITY_FILTER_README.md#validation) was done
+  on them. Every verdict records its `frame_source`.
+* **Stream frames** work when YouTube serves the media. ffmpeg cannot read YouTube URLs
+  directly (it sends open-ended range requests, which are refused), so frames are read
+  through a small localhost range-chunking proxy ([crawler/video_access.py](crawler/video_access.py)).
+* `--frame-source stream` is strict: a refused stream fails the check **closed** (the video
+  is not accepted), and **the run aborts after `--max-consecutive-errors` (default 5)
+  failures in a row**, saving what it has. The same abort applies to any other visual
+  failure (model error, ffmpeg error, network).
 
-To get the visual filter working, give yt-dlp either:
+To get full-resolution stream frames, give yt-dlp either:
 
 1. **Login cookies:** `--ytdlp-cookies cookies.txt` (export from a browser you are signed
    in with; treat the file as a credential and keep it out of git), or
 2. **A PO-token provider plugin** installed next to yt-dlp, e.g.
    [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider);
    yt-dlp loads installed plugins automatically.
-
-Without either, run `--filter none` (metadata filter only) and judge frames some other way.
 
 ## Output
 
@@ -159,13 +170,13 @@ Without either, run `--filter none` (metadata filter only) and judge frames some
 |---|---|
 | `id`, `video`, `video_url`, `name`, `city` | video id, URL, (HTML-unescaped) title, city |
 | `start_time`, `end_time`, `duration_seconds` | `0:00`, duration `H:MM:SS`, duration in seconds |
-| `time_of_day`, `time_of_day_source` | `night`/`day`/`morning`/... or `unknown`; source is `frames` (median frame brightness), `title` or `none` |
+| `time_of_day`, `time_of_day_source` | `night`/`day`/`morning`/... or `unknown`; source is `frames` (median frame brightness, thresholds calibrated on title-labelled videos), `title` or `none` |
 | `country_code`, `country_code_source`, `region_code` | ISO2; source `cities_file` or `gazetteer`. `region_code` is the code passed as `regionCode` |
 | `channel_name`, `channel_url`, `channel_id` | channel (the ID is what PedX-Insight stores) |
 | `published_at`, `view_count`, `like_count`, `comment_count`, `thumbnail_url`, `latitude`, `longitude` | free enrichment from the same `videos.list` call; `latitude`/`longitude` are the uploader's geotag, only when set |
 | `definition`, `projection`, `default_audio_language`, `live_broadcast` | content metadata |
 | `search_profile`, `search_query`, `search_language`, `search_duration`, `search_rank` | which stream found it, and at what rank |
-| `filter_backend`, `filter_score`, `run_id` | filter that accepted it, its score, the run |
+| `filter_backend`, `filter_score`, `frame_source`, `run_id` | filter that accepted it, its score, where its frames came from (`stream` or `thumbnails`), the run |
 
 Columns are only ever appended, so older files are widened in place by `--append`.
 
@@ -181,8 +192,13 @@ Columns are only ever appended, so older files are widened in place by `--append
 
 ### Validating the filters
 
-The thresholds have not been validated against labelled data. `scripts/evaluate_filter.py`
-does that:
+The default thresholds were checked against curated and query-defined sets without hand
+labels (see [Validation](crawler/QUALITY_FILTER_README.md#validation): metadata + YOLO kept
+84% of curated videos and rejected 90% of off-topic ones; metadata + InternVL3-1B kept 92% and
+rejected all 100 sampled off-topic videos, with the caveats listed there). For a
+publishable estimate you still need hand labels. The label-free validation is reproducible
+with `scripts/validate_filters.py` (`collect`, `score`, `report`; about 1,000 API units), and
+`scripts/evaluate_filter.py` produces and scores hand labels:
 
 ```bash
 make label-sample DECISIONS=data/outputs/runs/<id>/decisions.csv    # writes labels.csv
@@ -235,9 +251,14 @@ the GeoNames primary name before alternate names, because alternates include nic
 make test-unit        # ~200 offline tests; ML libraries are stubbed, no network needed
 ```
 
-GitHub Actions runs the same suite on Python 3.10 and 3.12 ([.github/workflows/tests.yml](.github/workflows/tests.yml)).
+The suite passes on Python 3.10.22, 3.12.9 and 3.14.8 (run locally on all three);
+GitHub Actions runs it on the versions in [.github/workflows/tests.yml](.github/workflows/tests.yml).
 The live paths (YouTube search, yt-dlp, ffmpeg, model inference) are exercised by `make smoke`,
 not by the suite.
+
+`uv.lock` pins every dependency of every extra (`make install-locked` = `uv sync --locked
+--extra dev`). For the ML extras on Windows with a GPU, install a CUDA build of `torch`
+with pip first instead: the lock pins the PyPI `torch` wheel, which is CPU-only on Windows.
 
 ## Project structure
 
@@ -256,8 +277,9 @@ crawler/
 scripts/
   discovery_to_mapping.py          # Crawler -> PedX-Insight bridge
   evaluate_filter.py               # label sampling + precision/recall estimation
+  validate_filters.py              # reproduces the label-free validation in QUALITY_FILTER_README.md
 data/cities*.txt, data/outputs/    # inputs; committed reference outputs
-pyproject.toml                     # dependencies and optional extras
+pyproject.toml, uv.lock            # dependencies, optional extras, pinned versions
 ```
 
 Requires Python 3.10+ (the ML extras follow their own libraries' requirements).
