@@ -185,6 +185,10 @@ DISCOVERY_FIELDS = [
     'time_of_day_source', 'country_code_source',
     'search_profile', 'search_query', 'search_language', 'search_duration', 'search_rank',
     'filter_backend', 'filter_score', 'run_id', 'frame_source',
+    'city_id', 'searched_city_id', 'verified_city_id', 'eligibility_status',
+    'location_verification_source', 'admin1_code', 'geonameid', 'city_identity_source',
+    'discovery_run_id', 'discovered_at', 'recording_date', 'recording_date_source',
+    'clip_start_seconds', 'clip_end_seconds', 'sampling_strategy', 'search_order',
 ]
 
 

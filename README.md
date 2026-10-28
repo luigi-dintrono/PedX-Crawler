@@ -61,12 +61,26 @@ It is read from `--api-key`, `--api-key-file` or `$YOUTUBE_API_KEY` (`.env` is l
 London,GB
 Tokyo,JP,東京
 Portland,US
+# Optional fourth/fifth fields disambiguate same-country names:
+Portland,US,,ME
+# City,CC,Local name,Admin1 code,GeoNames ID
 ```
 
 Always give the country code where you can: bare names are ambiguous (Portland, OR vs
 ME; London, GB vs CA). The crawler resolves a missing code from GeoNames by population and
 **warns when a rival candidate has at least 10% of the chosen city's population**. The
 local name is used in non-English queries.
+
+Discovery records now distinguish **the searched city** from **verified filming
+location**. `city_id` / `searched_city_id` are `geonames:<id>` when an unambiguous
+gazetteer match or explicit ID is available; otherwise they are deterministic
+`place:<country>:<admin1>:<name>` keys. Tokens use NFKD normalization, remove
+combining marks, casefold, replace non-alphanumeric runs with `-`, and use
+`unknown` for empty components. Supply an admin1 code or GeoNames ID for ambiguous
+places. Search relevance, an uploader geotag, and a street-scene filter do not
+verify a video's city. `verified_city_id` stays blank and `eligibility_status`
+stays `unverified` until an explicit review includes
+`location_verification_source` (for example `human:review-42`).
 
 ## Search profiles
 
@@ -190,6 +204,20 @@ Columns are only ever appended, so older files are widened in place by `--append
   `accept` / `reject` / `error`, reason, score, per-frame timestamps, scores and brightness,
   filter model and threshold. This is the audit trail for a PRISMA-style flow diagram.
 
+Accepted rows are flushed and synced to the discovery CSV immediately, including
+the current city's partial results. Ctrl-C, quota exhaustion, or a broken visual
+filter preserve those rows and return a nonzero exit code. Resume with `--append`;
+the accepted IDs are excluded from repeated work. Credential argument values are
+redacted in manifests. This is an acceptance checkpoint, not a guarantee that
+YouTube's changing relevance order can be replayed exactly.
+
+The additive provenance fields carry `discovery_run_id`, `discovered_at`,
+`sampling_strategy`, `search_order`, and the intended analysis interval
+`clip_start_seconds` / `clip_end_seconds`. `published_at` is the upload timestamp;
+it is never substituted for the recording date. `recording_date` is blank with
+`recording_date_source=unknown` unless the uploader supplies a recording date,
+which is explicitly labeled `uploader_metadata` rather than verified ground truth.
+
 ### Validating the filters
 
 The default thresholds were checked against curated and query-defined sets without hand
@@ -220,7 +248,9 @@ make bridge INSIGHT=/path/to/PedX-Insight DISCOVERY=data/outputs/discovery.csv
 * `mapping_one_each.csv` drives Insight's `run.py`. Names are underscore-free
   (`London1`, `Toronto2`, ...) so the `<name>_<videoid>` folder convention splits at the
   first underscore even for YouTube IDs that contain one.
-* `mapping.csv` gets one row per city. **New rows are geocoded offline from GeoNames**:
+* `mapping.csv` gets one row per city identity, including country and admin1.
+  Same-named places in different countries or subdivisions remain separate.
+  **New rows are geocoded offline from GeoNames**:
   `country`, `iso3`, `continent`, `lat`, `lon`, `population_city`, `population_country`
   (country and continent keep the spelling already used in `mapping.csv` for the same
   `iso3`). Existing rows are never re-geocoded; the socio-economic columns (`gmp`, `gini`,
@@ -232,9 +262,34 @@ make bridge INSIGHT=/path/to/PedX-Insight DISCOVERY=data/outputs/discovery.csv
 * List shapes match the native file: `videos`, `upload_date`, `vehicle_type`, `fps_list`
   and `channel` are flat lists (`[a,b]`); `time_of_day`, `start_time`, `end_time` are
   nested (`[[0],[1]]`), each aligned element-for-element with `videos`. `--append` merges
-  idempotently and preserves untouched rows byte-for-byte; files are written atomically.
+  idempotently and preserves existing names, intervals, status, review evidence and
+  extension columns. Each file is replaced atomically; retries reconcile their
+  video IDs independently, repairing a queue-only record after a partial update
+  even if a later invocation uses a different discovery input.
+* Both files gain the additive identity columns. The queue carries per-video
+  search/filter evidence, dates and clip intervals as scalar columns. The city
+  mapping's `video_provenance` JSON stores this evidence under each video ID;
+  verification or a recording date for one video never becomes a claim about all
+  videos in that city. Existing explicit reviews survive automatic appends. To
+  enrich an unverified queued video, supply its `verified_city_id`,
+  `eligibility_status`, and nonempty `location_verification_source` in discovery
+  and rerun the bridge. Do not use city centroids as observed filming coordinates.
 * End to end: crawler → `discovery.csv` → bridge → PedX-Insight `run.py --localize` →
-  `get_all_video_info.py` / `get_all_video_locations.py` → PedX-Visualizer `make db-pipeline`.
+  `python -m scripts.build_release --output NEW_DIRECTORY` → PedX-Visualizer
+  `npm run db:publish -- --csv-dir NEW_DIRECTORY`. Run the publisher with
+  `--validate-only` first. The release builder creates fresh aggregate/statistics
+  files and their checksum manifest; the publisher validates and activates them
+  atomically. Unverified discovery records need explicit review before they can
+  enter the default comparison population.
+
+The default sample remains relevance-ranked driving footage (with an HD filter),
+not a probability sample of streets or pedestrians. Use the existing stratified
+hand-label sample to check eligibility and filming city across languages,
+day/night conditions, camera types and frame sources. The label scaffold includes
+separate verification, recording-date and usable-interval fields. Keep cities and
+channels held out when selecting thresholds; evaluate the exact model checkpoint
+and frame source deployed. The existing thumbnail/1B weak-label estimates do not
+validate full-stream frames or the default 8B model.
 
 ### Geocoding accuracy
 
@@ -248,11 +303,11 @@ the GeoNames primary name before alternate names, because alternates include nic
 ## Tests and CI
 
 ```bash
-make test-unit        # ~200 offline tests; ML libraries are stubbed, no network needed
+make test-unit        # 239 offline tests; ML libraries are stubbed, no network needed
 ```
 
-The suite passes on Python 3.10.22, 3.12.9 and 3.14.8 (run locally on all three);
-GitHub Actions runs it on the versions in [.github/workflows/tests.yml](.github/workflows/tests.yml).
+The current suite passes on Python 3.12; GitHub Actions runs it on Python 3.12
+and 3.14, as configured in [.github/workflows/tests.yml](.github/workflows/tests.yml).
 The live paths (YouTube search, yt-dlp, ffmpeg, model inference) are exercised by `make smoke`,
 not by the suite.
 
@@ -271,6 +326,7 @@ crawler/
   video_quality_filter_internvl3.py# InternVL3 backend (native Transformers)
   video_access.py                  # yt-dlp stream resolution + localhost range proxy for ffmpeg
   gazetteer.py                     # offline GeoNames city / country lookup
+  contracts.py                    # additive city identity and per-video evidence fields
   provenance.py                    # decisions.csv + manifest.json
   QUALITY_FILTER_README.md         # filter details
   tests/                           # offline pytest suite

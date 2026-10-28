@@ -35,7 +35,8 @@ from dotenv import load_dotenv
 from filter_common import (COMMON_NEGATIVE_KEYWORDS, FilterResult, MetadataFilter,
                            time_of_day_from_title)
 from gazetteer import Gazetteer
-from provenance import DecisionLog, environment_info, new_run_id, utc_now, write_manifest
+from contracts import CONTRACT_FIELDS, IDENTITY_FIELDS, city_identity, contract_values
+from provenance import DecisionLog, environment_info, new_run_id, redact_argv, utc_now, write_manifest
 from search_profiles import (PROFILES, VALID_DEFINITIONS, VALID_DURATIONS, SearchStream,
                              build_streams, resolve_languages)
 
@@ -57,7 +58,7 @@ CSV_FIELDNAMES = [
     'time_of_day_source', 'country_code_source',
     'search_profile', 'search_query', 'search_language', 'search_duration', 'search_rank',
     'filter_backend', 'filter_score', 'run_id', 'frame_source',
-]
+] + CONTRACT_FIELDS
 
 SEARCH_PAGE_SIZE = 50  # search.list maximum; a page costs 100 units whatever its size
 DETAIL_PARTS = 'snippet,contentDetails,statistics,recordingDetails'  # 1 unit per 50 ids
@@ -134,7 +135,8 @@ class YouTubeDiscovery:
                  metadata_filter: Optional[MetadataFilter] = None, visual_filter=None,
                  decision_log: Optional[DecisionLog] = None, sampling: str = 'balanced',
                  max_pages: int = 10, definition: str = 'any', run_id: str = '',
-                 profile: str = '', youtube=None, max_consecutive_errors: int = 5):
+                 profile: str = '', youtube=None, max_consecutive_errors: int = 5,
+                 on_accept=None):
         self.youtube = youtube if youtube is not None else build('youtube', 'v3', developerKey=api_key)
         self.quota_tracker = quota_tracker or QuotaTracker()
         self.metadata_filter = metadata_filter
@@ -149,6 +151,10 @@ class YouTubeDiscovery:
         self.consecutive_visual_errors = 0
         # Stats from the most recent search_city() call (for the run summary/manifest).
         self.last_stats: Dict[str, int] = {}
+        self.on_accept = on_accept
+        self.city_context = {}
+        self.quota_stopped = False
+        self.had_errors = False
 
     def _execute_with_retry(self, request, what: str, max_retries: int = 3):
         """Execute an API request, retrying transient (5xx / network) errors with
@@ -196,6 +202,8 @@ class YouTubeDiscovery:
         kept: List[Dict[str, Any]] = []
         stats = {'pages': 0, 'examined': 0, 'kept': 0, 'rejected_metadata': 0,
                  'rejected_visual': 0, 'errors': 0}
+        self.last_stats = stats
+        self.quota_stopped = False
         quota_stop = False
         print(f"  Searching for {max_results} videos in {city} over {len(streams)} search stream(s) "
               f"[{self.sampling}]...")
@@ -212,6 +220,7 @@ class YouTubeDiscovery:
                 if not self.quota_tracker.can_make_search_request():
                     print(f"  QUOTA WARNING: Not enough quota to continue searching. {self.quota_tracker.get_status()}")
                     quota_stop = True
+                    self.quota_stopped = True
                     break
                 page = self._fetch_page(stream, published_after, published_before, region_code)
                 stats['pages'] += 1
@@ -259,10 +268,12 @@ class YouTubeDiscovery:
                 print(f"  QUOTA EXCEEDED on {stream.label()}. Wait for the daily reset or request more quota.")
                 raise
             print(f"  Error searching {stream.label()}: {e}")
+            self.had_errors = True
             stream.exhausted = True
             return []
         except Exception as e:
             print(f"  Unexpected error searching {stream.label()}: {e}")
+            self.had_errors = True
             stream.exhausted = True
             return []
         finally:
@@ -312,6 +323,7 @@ class YouTubeDiscovery:
             seen.add(c.video_id)  # mark seen only once actually examined
             stats['examined'] += 1
             video = self._build_video_data(c, details, city, region_code)
+            video.update(self.city_context)
             result = self._judge(video)
 
             self._track_visual_errors(result)
@@ -332,6 +344,11 @@ class YouTubeDiscovery:
                 video['filter_backend'] = self._backend_label()
                 video['filter_score'] = '' if result.score is None else result.score
                 kept.append(video)
+                stats['kept'] = len(kept)
+                # Persist at acceptance, rather than waiting for the whole city to
+                # finish. An interrupt, quota exception or breaker cannot lose it.
+                if self.on_accept:
+                    self.on_accept(video)
                 print(f"    [OK] {short_title}")
             else:
                 if result.error:
@@ -372,6 +389,7 @@ class YouTubeDiscovery:
         details = result.details
         visual = result.stage == 'visual'
         self.decision_log.write({
+            **{key: video.get(key, '') for key in CONTRACT_FIELDS},
             'run_id': self.run_id, 'city': city, 'country_code': country_code,
             'profile': self.profile, 'search_query': c.stream.query,
             'search_language': c.stream.language or '', 'search_duration': c.stream.duration,
@@ -448,6 +466,15 @@ class YouTubeDiscovery:
             'search_duration': c.stream.duration,
             'search_rank': c.rank,
             'run_id': self.run_id,
+            **contract_values({
+                'city': city, 'country_code': region_code,
+                'run_id': self.run_id, 'discovered_at': utc_now(),
+                'recording_date': recording.get('recordingDate') or '',
+                'recording_date_source': 'uploader_metadata' if recording.get('recordingDate') else 'unknown',
+                'clip_start_seconds': 0,
+                'clip_end_seconds': self._iso_duration_seconds(duration_iso),
+                'sampling_strategy': self.sampling, 'search_order': 'relevance',
+            }),
             # Used by the metadata filter only; not CSV columns (dropped on write).
             'description': snippet.get('description', ''),
             'tags': snippet.get('tags') or [],
@@ -502,6 +529,8 @@ class CityEntry:
     name: str
     country_code: Optional[str] = None   # from cities.txt ("City,CC")
     local_name: Optional[str] = None     # from cities.txt ("City,CC,Local name")
+    admin1_code: Optional[str] = None
+    geonameid: Optional[int] = None
 
 
 @dataclass
@@ -516,6 +545,8 @@ class CityPlan:
     longitude: Optional[float] = None
     ambiguous: bool = False
     stats: Dict[str, int] = field(default_factory=dict)
+    city_id: str = ''
+    admin1_code: str = ''
 
 
 def load_cities(file_path: str) -> List[CityEntry]:
@@ -531,7 +562,9 @@ def load_cities(file_path: str) -> List[CityEntry]:
                 parts = [p.strip() for p in line.split(',')]
                 entries.append(CityEntry(name=parts[0],
                                          country_code=(parts[1].upper() if len(parts) > 1 and parts[1] else None),
-                                         local_name=(parts[2] if len(parts) > 2 and parts[2] else None)))
+                                         local_name=(parts[2] if len(parts) > 2 and parts[2] else None),
+                                         admin1_code=(parts[3] if len(parts) > 3 and parts[3] else None),
+                                         geonameid=(int(parts[4]) if len(parts) > 4 and parts[4] else None)))
     except FileNotFoundError:
         print(f"Error: Cities file not found at {file_path}")
         sys.exit(1)
@@ -544,7 +577,8 @@ def load_cities(file_path: str) -> List[CityEntry]:
 def plan_city(entry: CityEntry, gazetteer: Gazetteer, profile, language_spec: str,
               durations: List[str], all_terms: bool) -> CityPlan:
     """Resolve a city's country/language and build its search streams."""
-    city_info = gazetteer.resolve_city(entry.name, entry.country_code)
+    city_info = gazetteer.resolve_city(entry.name, entry.country_code,
+                                      entry.admin1_code, entry.geonameid)
     if entry.country_code:
         cc, source = entry.country_code, 'cities_file'
     elif city_info:
@@ -556,11 +590,14 @@ def plan_city(entry: CityEntry, gazetteer: Gazetteer, profile, language_spec: st
     languages = resolve_languages(language_spec, profile, country_languages)
     streams = build_streams(profile, entry.name, languages, durations, all_terms=all_terms,
                             local_name=entry.local_name)
+    geo = entry.geonameid or (city_info.geonameid if city_info and not city_info.ambiguous else None)
+    admin = entry.admin1_code or (city_info.admin1_code if city_info and not city_info.ambiguous else '')
     return CityPlan(entry=entry, country_code=cc, country_code_source=source, languages=languages,
                     streams=streams, geonameid=city_info.geonameid if city_info else None,
                     latitude=city_info.latitude if city_info else None,
                     longitude=city_info.longitude if city_info else None,
-                    ambiguous=bool(city_info and city_info.ambiguous and not entry.country_code))
+                    ambiguous=bool(city_info and city_info.ambiguous),
+                    city_id=city_identity(entry.name, cc, admin, geo), admin1_code=admin)
 
 
 # --- CSV I/O --------------------------------------------------------------------
@@ -677,6 +714,8 @@ def _write_rows(path: str, videos: List[Dict[str, Any]], write_header: bool, mod
         if write_header:
             writer.writeheader()
         writer.writerows(videos)
+        csvfile.flush()
+        os.fsync(csvfile.fileno())
     return path
 
 
@@ -906,7 +945,7 @@ def main():
                 'transformers', 'torch', 'Pillow']
     manifest: Dict[str, Any] = {
         'run_id': run_id, 'status': 'running', 'started_utc': utc_now(), 'finished_utc': None,
-        'argv': sys.argv[1:],
+        'argv': redact_argv(sys.argv[1:]),
         'parameters': {
             'profile': profile.name, 'languages': args.languages, 'video_durations': durations,
             'definition': definition, 'sampling': args.sampling,
@@ -926,9 +965,15 @@ def main():
     write_manifest(manifest_path, manifest)
     print(f"Run {run_id}: provenance in {run_dir}")
 
+    # Reserve and widen the actual output before spending quota. Accepted rows are
+    # flushed there one at a time; the finalizer never reconstructs them from a
+    # partially returned search_city() call.
+    actual_output_path = save_to_csv([], args.output, append=args.append)
+    manifest['output_csv'] = actual_output_path
+    write_manifest(manifest_path, manifest)
     exclude_paths = list(args.exclude_existing or [])
     if args.append and os.path.exists(args.output):
-        exclude_paths.append(args.output)  # appending is idempotent
+        exclude_paths.append(actual_output_path)  # appending is idempotent
     global_seen = load_seen_ids(exclude_paths)
     if global_seen:
         print(f"Excluding {len(global_seen):,} already-known video ID(s) from prior CSV(s)")
@@ -937,24 +982,39 @@ def main():
         print_plan(plans, args, profile, args.sampling, args.max_pages_per_city, definition,
                    durations, metadata_desc, filter_desc, per_city)
 
+    all_videos: List[Dict[str, Any]] = []
+
+    def checkpoint_accept(video):
+        _write_rows(actual_output_path, [video], write_header=False, mode='a')
+        all_videos.append(video)
+
     quota_tracker = QuotaTracker(daily_limit=args.quota_limit)
     discovery = YouTubeDiscovery(api_key, quota_tracker, metadata_filter, visual_filter,
                                  decision_log, sampling=args.sampling,
                                  max_pages=args.max_pages_per_city, definition=definition,
                                  run_id=run_id, profile=profile.name,
-                                 max_consecutive_errors=args.max_consecutive_errors)
+                                 max_consecutive_errors=args.max_consecutive_errors,
+                                 on_accept=checkpoint_accept)
 
-    all_videos: List[Dict[str, Any]] = []
     processed: List[CityPlan] = []
     status = 'completed'
     try:
         for i, plan in enumerate(plans, 1):
             city = plan.entry.name
             if plan.ambiguous:
-                print(f"Warning: '{city}' is ambiguous without a country code; resolved to "
-                      f"{plan.country_code}. Add 'City,CC' to the cities file to be sure.")
+                print(f"Warning: '{city}' is ambiguous in {plan.country_code}; supply "
+                      "an admin1 code or GeoNames ID in the cities file before making city claims.")
             print(f"[{i}/{len(plans)}] {city} ({plan.country_code}) - {quota_tracker.get_status()}")
             region = plan.country_code if plan.country_code != 'UNKNOWN' else None
+            discovery.city_context = {
+                **{key: value for key, value in contract_values(
+                    {'city_id': plan.city_id}, city=city, country_code=plan.country_code,
+                    admin1_code=plan.admin1_code,
+                    geonameid=plan.geonameid if plan.city_id.startswith('geonames:') else '').items()
+                   if key in IDENTITY_FIELDS},
+                'country_code': plan.country_code,
+                'country_code_source': plan.country_code_source,
+            }
             try:
                 videos = discovery.search_city(city, plan.streams, per_city, since_date_iso,
                                                until_date_iso, region_code=region,
@@ -962,9 +1022,11 @@ def main():
                 for v in videos:
                     v['country_code'] = plan.country_code
                     v['country_code_source'] = plan.country_code_source
-                all_videos.extend(videos)
                 plan.stats = dict(discovery.last_stats)
                 processed.append(plan)
+                if discovery.quota_stopped:
+                    status = 'quota_exceeded'
+                    break
             except VisualFilterBroken as e:
                 print(f"ABORTING: {e}")
                 print("The visual filter is not working in this environment; fix it (see README, "
@@ -978,16 +1040,21 @@ def main():
                     status = 'quota_exceeded'
                     break
                 print(f"Error searching videos for {city}: {e}")
+                status = 'error'
             except Exception as e:
                 print(f"Error searching videos for {city}: {e}")
+                status = 'error'
+            finally:
+                plan.stats = dict(discovery.last_stats)
     except KeyboardInterrupt:
         status = 'interrupted'
         print("\nInterrupted (Ctrl-C) - saving the results gathered so far...")
     finally:
         # Always persist whatever was collected, so an interrupt / crash / quota
         # stop never discards quota-expensive results.
-        actual_output_path = save_to_csv(all_videos, args.output, append=args.append)
         decision_log.close()
+        if status == 'completed' and discovery.had_errors:
+            status = 'error'
         if status == 'completed' and sys.exc_info()[0] is not None:
             status = 'error'
         manifest.update({
@@ -996,6 +1063,7 @@ def main():
             'cities': [{'city': p.entry.name, 'country_code': p.country_code,
                         'country_code_source': p.country_code_source, 'geonameid': p.geonameid,
                         'latitude': p.latitude, 'longitude': p.longitude, 'ambiguous': p.ambiguous,
+                        'city_id': p.city_id, 'admin1_code': p.admin1_code,
                         'languages': p.languages, 'streams': [s.label() for s in p.streams],
                         'processed': p in processed, **p.stats} for p in plans],
         })
@@ -1012,6 +1080,8 @@ def main():
         print(f"Results saved to: {actual_output_path}")
         print(f"Decisions log: {decisions_path}")
         print(f"Final quota usage: {quota_tracker.get_status()}")
+    if status != 'completed':
+        raise SystemExit(130 if status == 'interrupted' else 1)
 
 
 if __name__ == '__main__':

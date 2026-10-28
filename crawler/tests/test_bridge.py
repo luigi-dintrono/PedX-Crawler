@@ -235,11 +235,11 @@ def test_append_keeps_aligned_columns_in_step(bridge, monkeypatch, tmp_path):
     mapping = tmp_path / 'map.csv'
     rows = []
     populated = {c: '' for c in bridge.MAPPING_HEADER}
-    populated.update(id='1', city='Toronto', videos='[a,b]', time_of_day='[[0],[0]]',
+    populated.update(id='1', city='Toronto', country='Canada', videos='[a,b]', time_of_day='[[0],[0]]',
                      start_time='[[0],[0]]', end_time='[[10],[20]]', vehicle_type='[0,0]',
                      upload_date='[20200101,20200102]', fps_list='[30,30]', channel='[x,y]')
     blank = {c: '' for c in bridge.MAPPING_HEADER}
-    blank.update(id='2', city='Ulm', videos='[c]', time_of_day='[[0]]', start_time='[[0]]',
+    blank.update(id='2', city='Ulm', country='Germany', videos='[c]', time_of_day='[[0]]', start_time='[[0]]',
                  end_time='[[5]]', upload_date='[20200103]', channel='[z]')
     rows += [populated, blank]
     with open(mapping, 'w', newline='', encoding='utf-8') as f:

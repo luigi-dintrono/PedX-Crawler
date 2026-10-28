@@ -39,7 +39,10 @@ STRATA = ('accept', 'reject:metadata', 'reject:visual')
 POSITIVE = {'1', 'yes', 'y', 'true', 'relevant', 'usable'}
 NEGATIVE = {'0', 'no', 'n', 'false', 'irrelevant', 'unusable'}
 LABEL_FIELDS = ['video_id', 'video_url', 'title', 'city', 'stratum', 'stage', 'reason', 'score',
-                'label', 'notes']
+                'label', 'notes', 'searched_city_id', 'country_code', 'admin1_code', 'frame_source',
+                'verified_city_id', 'eligibility_status', 'location_verification_source',
+                'recording_date', 'recording_date_source', 'clip_start_seconds', 'clip_end_seconds',
+                'camera_type']
 
 
 def stratum_of(row: Dict[str, str]) -> Optional[str]:
@@ -155,7 +158,8 @@ def cmd_sample(args):
             rows.append({'video_id': r['video_id'], 'video_url': f"https://www.youtube.com/watch?v={r['video_id']}",
                          'title': r.get('title', ''), 'city': r.get('city', ''), 'stratum': h,
                          'stage': r.get('stage', ''), 'reason': r.get('reason', ''),
-                         'score': r.get('score', ''), 'label': '', 'notes': ''})
+                         'score': r.get('score', ''), 'label': '', 'notes': '',
+                         **{key: r.get(key, '') for key in LABEL_FIELDS[10:]}})
         print(f"{h}: sampled {take} of {len(pool)}")
     # Shuffle so the labeller does not see the filter's verdict as an ordering cue.
     order = rng.permutation(len(rows))

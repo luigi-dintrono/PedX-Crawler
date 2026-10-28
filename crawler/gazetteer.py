@@ -44,6 +44,7 @@ class CityInfo:
     population: int
     match: str  # 'name' or 'alternate'
     ambiguous: bool = False  # a rival candidate has >= 10% of this city's population
+    admin1_code: str = ''
 
 
 @dataclass(frozen=True)
@@ -140,21 +141,43 @@ class Gazetteer:
                            continent=self._continents.get(continent_code, continent_code),
                            population=int(raw.get('population') or 0), languages=languages)
 
-    def resolve_city(self, name: str, country_code: Optional[str] = None) -> Optional[CityInfo]:
+    def country_code(self, value):
+        """Resolve a legacy mapping's ISO2, ISO3 or full country name offline."""
+        if not value or not self.available:
+            return ''
+        target = normalize_name(value)
+        for raw in self._cache(self.POPULATION_TIERS[0]).get_countries().values():
+            if target in {normalize_name(raw.get(key, '')) for key in ('iso', 'iso3', 'name')}:
+                return raw['iso']
+        return ''
+
+    def resolve_city(self, name: str, country_code: Optional[str] = None,
+                     admin1_code: Optional[str] = None, geonameid=None) -> Optional[CityInfo]:
         """Best GeoNames match for a city name (optionally within one country), or None."""
         if not self.available or not name or not name.strip():
             return None
         cc = country_code.strip().upper() if country_code and country_code.strip() else None
         if cc == 'UNKNOWN':
             cc = None
-        key = (normalize_name(name), cc)
+        admin = str(admin1_code or '').strip().upper()
+        key = (normalize_name(name), cc, admin, str(geonameid or ''))
         if key in self._city_cache:
             return self._city_cache[key]
         result = None
+        if geonameid:
+            for tier in self.POPULATION_TIERS:
+                raw = self._cache(tier).get_cities().get(str(geonameid))
+                if raw and (not cc or raw.get('countrycode') == cc) and (
+                        not admin or str(raw.get('admin1code', '')).upper() == admin):
+                    result = self._pick([raw], 'geonameid')
+                    break
+            self._city_cache[key] = result
+            return result
         for kind in ('name', 'alternate'):
             for tier in self.POPULATION_TIERS:
                 pool = [c for k, c in self._city_index(tier).get(key[0], [])
-                        if k == kind and (cc is None or c.get('countrycode') == cc)]
+                        if k == kind and (cc is None or c.get('countrycode') == cc)
+                        and (not admin or str(c.get('admin1code', '')).upper() == admin)]
                 if pool:
                     result = self._pick(pool, kind)
                     break
@@ -173,4 +196,5 @@ class Gazetteer:
         return CityInfo(name=best['name'], geonameid=int(best['geonameid']),
                         country_code=best['countrycode'],
                         latitude=float(best['latitude']), longitude=float(best['longitude']),
-                        population=best_pop, match=kind, ambiguous=ambiguous)
+                        population=best_pop, match=kind, ambiguous=ambiguous,
+                        admin1_code=str(best.get('admin1code') or ''))

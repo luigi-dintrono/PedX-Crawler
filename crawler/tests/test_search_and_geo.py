@@ -111,6 +111,15 @@ def test_ambiguous_flag(gz):
     assert gz.resolve_city('Portland', 'US').ambiguous is True
 
 
+def test_admin_and_explicit_geonames_disambiguate_city(gz):
+    oregon = gz.resolve_city('Portland', 'US', 'OR')
+    maine = gz.resolve_city('Portland', 'US', 'ME')
+    assert oregon.geonameid != maine.geonameid
+    assert oregon.admin1_code == 'OR' and maine.admin1_code == 'ME'
+    assert gz.resolve_city('Portland', 'US', 'ME', maine.geonameid).geonameid == maine.geonameid
+    assert gz.resolve_city('Portland', 'US', 'OR', maine.geonameid) is None
+
+
 def test_unknown_city(gz):
     assert gz.resolve_city('Nowhereville Xyzzy', 'GB') is None
     assert gz.resolve_city('', 'GB') is None
@@ -137,7 +146,8 @@ def test_decision_log_appends_with_single_header(tmp_path):
     assert [r['video_id'] for r in rows] == ['a', 'b']
     assert json.loads(rows[0]['frame_scores']) == [1.0, 0.0]
     assert rows[0]['timestamp_utc'].endswith('Z')
-    assert open(path, encoding='utf-8').read().count('run_id,') == 1
+    with open(path, newline='', encoding='utf-8') as f:
+        assert sum(row[0] == 'run_id' for row in csv.reader(f)) == 1
 
 
 def test_manifest_and_environment(tmp_path):

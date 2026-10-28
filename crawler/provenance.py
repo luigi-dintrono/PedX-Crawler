@@ -17,6 +17,7 @@ import sys
 from datetime import datetime, timezone
 from importlib import metadata
 from typing import Any, Dict, Iterable, Optional
+from contracts import CONTRACT_FIELDS
 
 DECISION_FIELDS = [
     'run_id', 'timestamp_utc', 'city', 'country_code', 'profile',
@@ -25,7 +26,26 @@ DECISION_FIELDS = [
     'projection', 'live_broadcast', 'default_audio_language',
     'stage', 'decision', 'reason', 'score', 'backend', 'model', 'threshold',
     'frame_source', 'frame_timestamps', 'frame_scores', 'frame_brightness', 'time_of_day',
-]
+] + CONTRACT_FIELDS
+
+
+def redact_argv(argv):
+    """Retain reproducible flags without storing keys, tokens, cookies or passwords."""
+    out, redact_next = [], False
+    for arg in argv:
+        if redact_next:
+            out.append('[REDACTED]')
+            redact_next = False
+            continue
+        flag, sep, _ = str(arg).partition('=')
+        sensitive = flag.startswith('--') and any(
+            token in flag.lower() for token in ('api-key', 'token', 'password', 'secret', 'cookies'))
+        if sensitive:
+            out.append(flag + '=[REDACTED]' if sep else flag)
+            redact_next = not sep
+        else:
+            out.append(arg)
+    return out
 
 
 def utc_now() -> str:
