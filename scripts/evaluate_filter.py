@@ -42,7 +42,7 @@ LABEL_FIELDS = ['video_id', 'video_url', 'title', 'city', 'stratum', 'stage', 'r
                 'label', 'notes', 'searched_city_id', 'country_code', 'admin1_code', 'frame_source',
                 'verified_city_id', 'eligibility_status', 'location_verification_source',
                 'recording_date', 'recording_date_source', 'clip_start_seconds', 'clip_end_seconds',
-                'camera_type']
+                'camera_type', 'decision_run_id', 'decision_timestamp_utc']
 
 
 def stratum_of(row: Dict[str, str]) -> Optional[str]:
@@ -105,6 +105,8 @@ def bootstrap_recall(sizes, labels, n_boot=4000, seed=0):
 
 def evaluate(decisions: Dict[str, Dict[str, str]], label_rows: List[Dict[str, str]],
              n_boot: int = 4000, seed: int = 0) -> dict:
+    if n_boot < 1:
+        raise ValueError('bootstrap iterations must be at least 1')
     sizes = {h: 0 for h in STRATA}
     errors = 0
     for row in decisions.values():
@@ -114,7 +116,8 @@ def evaluate(decisions: Dict[str, Dict[str, str]], label_rows: List[Dict[str, st
         else:
             errors += 1
     labels: Dict[str, List[int]] = {h: [] for h in STRATA}
-    unmatched = 0
+    unmatched = duplicates = 0
+    labelled_videos = {}
     for row in label_rows:
         y = parse_label(row.get('label', ''))
         if y is None:
@@ -124,6 +127,24 @@ def evaluate(decisions: Dict[str, Dict[str, str]], label_rows: List[Dict[str, st
         if h is None:
             unmatched += 1
             continue
+        # The sampled stratum belongs to the decision that produced this label
+        # sheet. Silently moving old labels into a new decision's stratum breaks
+        # the stratified sampling design and can bias precision and recall.
+        vid = row.get('video_id', '')
+        if row.get('stratum') and row['stratum'] != h:
+            raise ValueError(f'Label for {vid!r} belongs to a different decision stratum; '
+                             'resample the current decisions')
+        for label_key, decision_key in (('decision_run_id', 'run_id'),
+                                        ('decision_timestamp_utc', 'timestamp_utc')):
+            if row.get(label_key) and row[label_key] != decision.get(decision_key, ''):
+                raise ValueError(f'Label for {vid!r} belongs to a different decision; '
+                                 'resample the current decisions')
+        if vid in labelled_videos:
+            if labelled_videos[vid] != y:
+                raise ValueError(f'Conflicting labels for video {vid!r}; adjudicate before evaluation')
+            duplicates += 1
+            continue
+        labelled_videos[vid] = y
         labels[h].append(y)
 
     def proportion(h):
@@ -138,6 +159,7 @@ def evaluate(decisions: Dict[str, Dict[str, str]], label_rows: List[Dict[str, st
                   if total and all(labels[h] or not sizes[h] for h in STRATA) else None)
     return {
         'population': sizes, 'errors_excluded': errors, 'labels_unmatched': unmatched,
+        'duplicate_labels_ignored': duplicates,
         'precision': proportion('accept'),
         'false_rejection_rate': {'metadata': proportion('reject:metadata'),
                                  'visual': proportion('reject:visual')},
@@ -159,7 +181,9 @@ def cmd_sample(args):
                          'title': r.get('title', ''), 'city': r.get('city', ''), 'stratum': h,
                          'stage': r.get('stage', ''), 'reason': r.get('reason', ''),
                          'score': r.get('score', ''), 'label': '', 'notes': '',
-                         **{key: r.get(key, '') for key in LABEL_FIELDS[10:]}})
+                         **{key: r.get(key, '') for key in LABEL_FIELDS[10:]},
+                         'decision_run_id': r.get('run_id', ''),
+                         'decision_timestamp_utc': r.get('timestamp_utc', '')})
         print(f"{h}: sampled {take} of {len(pool)}")
     # Shuffle so the labeller does not see the filter's verdict as an ordering cue.
     order = rng.permutation(len(rows))
@@ -184,7 +208,8 @@ def cmd_evaluate(args):
         label_rows = list(csv.DictReader(f))
     report = evaluate(decisions, label_rows, n_boot=args.bootstrap, seed=args.seed)
     print(f"Population: {report['population']}  (errors excluded: {report['errors_excluded']}, "
-          f"labels not in decisions: {report['labels_unmatched']})")
+          f"labels not in decisions: {report['labels_unmatched']}, "
+          f"duplicate labels ignored: {report['duplicate_labels_ignored']})")
     print(f"Precision (usable | accepted):            {fmt(report['precision'])}")
     print(f"False rejections, metadata stage:          {fmt(report['false_rejection_rate']['metadata'])}")
     print(f"False rejections, visual stage:            {fmt(report['false_rejection_rate']['visual'])}")

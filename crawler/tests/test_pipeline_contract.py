@@ -105,10 +105,11 @@ def test_append_preserves_existing_verification_window_and_extension(bridge, mon
         writer = csv.DictWriter(f, fieldnames=list(queue[0]))
         writer.writeheader()
         writer.writerows(queue)
-    after, _ = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    after, mapping = bridge_run(bridge, monkeypatch, tmp_path, discovery)
     for key in ('name', 'start_time', 'end_time', 'finished', 'verified_city_id',
                 'eligibility_status', 'location_verification_source', 'operator_note'):
         assert after[0][key] == queue[0][key]
+    assert mapping[0]['start_time'] == '[[12]]' and mapping[0]['end_time'] == '[[34]]'
 
 
 def test_explicit_review_enriches_unverified_queue_without_automatic_reversal(bridge, monkeypatch, tmp_path):
@@ -126,6 +127,107 @@ def test_explicit_review_enriches_unverified_queue_without_automatic_reversal(br
     queue, mapping = bridge_run(bridge, monkeypatch, tmp_path, discovery)
     assert queue[0]['location_verification_source'] == 'human:review42'
     assert json.loads(mapping[0]['video_provenance'])['v1']['eligibility_status'] == 'verified'
+
+
+def test_mapping_only_recovery_preserves_city_window_and_review(bridge, monkeypatch, tmp_path):
+    discovery = tmp_path / 'discovery.csv'
+    original = discovery_row('v1', 'Ulm', 'DE', end_time='34')
+    original.update(start_time='12', verified_city_id='geonames:2820256', eligibility_status='verified',
+                    location_verification_source='human:review42')
+    write_discovery_csv(discovery, [original])
+    _, before_mapping = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    (tmp_path / 'queue.csv').unlink()
+    # The same upload can rank for another city's search. It is still the old job.
+    write_discovery_csv(discovery, [discovery_row('v1', 'London', 'GB', end_time='1800')])
+    queue, mapping = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    assert queue[0]['city'] == 'Ulm' and queue[0]['country_code'] == 'DE'
+    assert queue[0]['name'] == 'Ulm1'
+    assert (queue[0]['start_time'], queue[0]['end_time']) == ('12', '34')
+    assert queue[0]['clip_start_seconds'] == '12' and queue[0]['clip_end_seconds'] == '34'
+    assert queue[0]['eligibility_status'] == 'verified'
+    assert queue[0]['location_verification_source'] == 'human:review42'
+    assert mapping == before_mapping
+
+
+def test_mapping_only_recovery_rejects_multi_interval_jobs_without_writing(bridge, monkeypatch, tmp_path):
+    discovery = tmp_path / 'discovery.csv'
+    write_discovery_csv(discovery, [discovery_row('v1', 'Ulm', 'DE')])
+    _, mapping = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    mapping[0].update(start_time='[[12,60]]', end_time='[[34,90]]')
+    bridge.write_csv_atomic(str(tmp_path / 'mapping.csv'), list(mapping[0]), mapping)
+    (tmp_path / 'queue.csv').unlink()
+    before = (tmp_path / 'mapping.csv').read_bytes()
+    with pytest.raises(ValueError, match='multiple or missing intervals'):
+        bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    assert not (tmp_path / 'queue.csv').exists()
+    assert (tmp_path / 'mapping.csv').read_bytes() == before
+
+
+def test_mapping_only_recovery_does_not_inherit_citywide_verification(bridge, monkeypatch, tmp_path):
+    entry = dict(city='Ulm', country='Germany', videos='[v1]', time_of_day='[[0]]',
+                 start_time='[[12]]', end_time='[[34]]', eligibility_status='verified',
+                 verified_city_id='geonames:2820256', location_verification_source='city-wide')
+    recovered = bridge.mapped_video_metadata(entry, 'v1')
+    assert not recovered['verified_city_id']
+    assert not recovered['location_verification_source']
+
+
+def test_native_mapping_recovery_clears_new_discovery_identity(bridge, monkeypatch, tmp_path):
+    entry = dict(city='Ulm', country='Germany', videos='[v1]', time_of_day='[[0]]',
+                 start_time='[[12]]', end_time='[[34]]')
+    bridge.write_csv_atomic(str(tmp_path / 'mapping.csv'), list(entry), [entry])
+    discovery = tmp_path / 'discovery.csv'
+    row = discovery_row('v1', 'London', 'GB')
+    row.update(city_id='geonames:2643743', searched_city_id='geonames:2643743')
+    write_discovery_csv(discovery, [row])
+    queue, _ = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    assert queue[0]['city'] == 'Ulm'
+    assert queue[0]['searched_city_id'] != 'geonames:2643743'
+    assert queue[0]['clip_start_seconds'] == '12'
+
+
+@pytest.mark.parametrize('duplicate_file', ['mapping.csv', 'queue.csv'])
+def test_duplicate_existing_video_assignments_fail_without_writing(
+        bridge, monkeypatch, tmp_path, duplicate_file):
+    discovery = tmp_path / 'discovery.csv'
+    write_discovery_csv(discovery, [discovery_row('v1', 'Ulm', 'DE')])
+    bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    rows = read(tmp_path / duplicate_file)
+    rows.append({**rows[0], 'city': 'London'})
+    bridge.write_csv_atomic(str(tmp_path / duplicate_file), list(rows[0]), rows)
+    before = {name: (tmp_path / name).read_bytes() for name in ('mapping.csv', 'queue.csv')}
+    with pytest.raises(ValueError, match='(Ambiguous mapped|Duplicate queued) video'):
+        bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    assert all((tmp_path / name).read_bytes() == content for name, content in before.items())
+
+
+def test_queue_mapping_city_disagreement_fails_before_writing(bridge, monkeypatch, tmp_path):
+    discovery = tmp_path / 'discovery.csv'
+    write_discovery_csv(discovery, [discovery_row('v1', 'Ulm', 'DE')])
+    queue, _ = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    queue[0].update(city='London', country_code='GB', city_id='geonames:2643743',
+                    searched_city_id='geonames:2643743', geonameid='2643743', admin1_code='ENG')
+    bridge.write_csv_atomic(str(tmp_path / 'queue.csv'), list(queue[0]), queue)
+    before = {name: (tmp_path / name).read_bytes() for name in ('mapping.csv', 'queue.csv')}
+    with pytest.raises(ValueError, match='Conflicting city assignments'):
+        bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    assert all((tmp_path / name).read_bytes() == content for name, content in before.items())
+
+
+def test_unrelated_ambiguous_historical_rows_do_not_block_new_discovery(
+        bridge, monkeypatch, tmp_path):
+    discovery = tmp_path / 'discovery.csv'
+    write_discovery_csv(discovery, [discovery_row('old', 'Ulm', 'DE')])
+    _, mapping = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    mapping.append({**mapping[0], 'id': '2', 'city': 'London', 'country': 'United Kingdom',
+                    'country_code': 'GB', 'city_id': 'geonames:2643743',
+                    'searched_city_id': 'geonames:2643743'})
+    bridge.write_csv_atomic(str(tmp_path / 'mapping.csv'), list(mapping[0]), mapping)
+    write_discovery_csv(discovery, [discovery_row('new', 'New York', 'US')])
+    queue, after = bridge_run(bridge, monkeypatch, tmp_path, discovery)
+    assert after[:2] == mapping
+    assert {r['video'] for r in queue} == {'old', 'new'}
+    assert after[2]['videos'] == '[new]'
 
 
 @pytest.mark.parametrize('stop', ['interrupt', 'breaker', 'quota'])
