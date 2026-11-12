@@ -54,6 +54,38 @@ def test_recall_needs_every_stratum_labelled(ev):
     assert r['recall']['estimate'] is None
 
 
+def test_repeated_labels_do_not_change_estimates_or_confidence(ev):
+    labels = _labels('a', 20, 18) + _labels('m', 20, 2) + _labels('v', 20, 4)
+    original = ev.evaluate(_decisions(), labels, n_boot=50)
+    repeated = ev.evaluate(_decisions(), labels + labels[:10], n_boot=50)
+    assert repeated.pop('duplicate_labels_ignored') == 10
+    assert original.pop('duplicate_labels_ignored') == 0
+    assert repeated == original
+
+
+def test_conflicting_repeated_labels_require_adjudication(ev):
+    with pytest.raises(ValueError, match='Conflicting labels'):
+        ev.evaluate(_decisions(), [{'video_id': 'a0', 'label': '1'},
+                                    {'video_id': 'a0', 'label': '0'}], n_boot=50)
+
+
+@pytest.mark.parametrize('stale', [
+    {'stratum': 'reject:visual'},
+    {'decision_run_id': 'old-run'},
+    {'decision_timestamp_utc': '2026-09-01T00:00:00Z'},
+])
+def test_old_decision_labels_cannot_be_regrouped_against_new_decisions(ev, stale):
+    decisions = _decisions()
+    decisions['a0']['run_id'] = 'current-run'
+    with pytest.raises(ValueError, match='belongs to a different decision'):
+        ev.evaluate(decisions, [{'video_id': 'a0', 'label': '1', **stale}], n_boot=50)
+
+
+def test_bootstrap_iterations_must_be_positive(ev):
+    with pytest.raises(ValueError, match='at least 1'):
+        ev.evaluate(_decisions(), _labels('a', 1, 1), n_boot=0)
+
+
 @pytest.mark.parametrize("raw,value", [('1', 1), ('Yes', 1), ('usable', 1), ('0', 0), ('n', 0),
                                        ('', None), ('maybe', None)])
 def test_parse_label(ev, raw, value):
@@ -72,4 +104,5 @@ def test_sample_command_is_stratified_and_shuffled(ev, tmp_path):
     counts = {h: sum(r['stratum'] == h for r in rows) for h in ev.STRATA}
     assert counts == {'accept': 10, 'reject:metadata': 5, 'reject:visual': 10}
     assert all(r['label'] == '' for r in rows)
+    assert all(r['decision_timestamp_utc'] == '2026-10-10T00:00:00Z' for r in rows)
     assert [r['stratum'] for r in rows] != sorted(r['stratum'] for r in rows)  # not grouped
