@@ -202,6 +202,51 @@ def read_csv_rows(path):
         return list(csv.DictReader(f))
 
 
+def mapped_video_metadata(entry, vid):
+    """Recover one queued job from an existing mapping, without rediscovering it.
+
+    A video may be found again under a different city or after an operator has
+    shortened its analysis interval. The existing mapping owns that association;
+    fresh search metadata cannot supply a replacement city or analysis window.
+    Multi-interval legacy entries need an explicit queue instead of guessing.
+    """
+    videos = parse_bracketed(entry.get('videos'))
+    index = videos.index(vid)
+    try:
+        provenance = json.loads(entry.get('video_provenance') or '{}')
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid video_provenance for city {entry.get('city')!r}") from exc
+    if not isinstance(provenance, dict) or not isinstance(provenance.get(vid, {}), dict):
+        raise ValueError('video_provenance must contain objects keyed by video ID')
+    recovered = {key: entry.get(key, '') for key in IDENTITY_FIELDS}
+    # City-level verification must never be copied to an individual video.
+    for key in ('verified_city_id', 'eligibility_status', 'location_verification_source'):
+        recovered.pop(key, None)
+    recovered.update(provenance.get(vid, {}))
+    recovered.update(city=entry.get('city', ''), country_code=entry.get('country_code', ''),
+                     region_code=entry.get('country_code', ''),
+                     country=entry.get('country', ''), iso3=entry.get('iso3', ''),
+                     state=entry.get('state', ''))
+    for key in ('verified_city_id', 'eligibility_status', 'location_verification_source'):
+        recovered[key] = provenance.get(vid, {}).get(key, '')
+    for key, evidence_key in (('start_time', 'clip_start_seconds'),
+                              ('end_time', 'clip_end_seconds'), ('time_of_day', None)):
+        items = parse_nested(entry.get(key))
+        if len(items) != len(videos):
+            raise ValueError(f"Cannot recover {vid}: {key} is not aligned with videos")
+        values = parse_bracketed(items[index])
+        if len(values) != 1:
+            raise ValueError(f"Cannot recover {vid}: {key} has multiple or missing intervals; "
+                             'supply an explicit queue row')
+        value = parse_duration_seconds(values[0]) if evidence_key else values[0]
+        if evidence_key and value is None:
+            raise ValueError(f"Cannot recover {vid}: invalid {key}")
+        recovered[key] = value
+        if evidence_key:
+            recovered[evidence_key] = value
+    return recovered
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--discovery', default='data/outputs/discovery.csv')
@@ -262,12 +307,19 @@ def main():
         values = contract_values(row, country_code=cc, admin1_code=admin, geonameid=geo)
         return cc, values
 
-    queue_by_video = {r.get('video'): r for r in one_each_rows}
-    city_first_row, mapping_video_rows = {}, {}
+    queue_by_video, duplicate_queued = {}, set()
+    for queued in one_each_rows:
+        vid = queued.get('video')
+        if vid in queue_by_video:
+            duplicate_queued.add(vid)
+        queue_by_video.setdefault(vid, queued)
+    city_first_row, mapping_video_rows, ambiguous_mapped = {}, {}, set()
     for i, entry in enumerate(mapping_rows):
         _, identity = identity_for(entry)
         city_first_row.setdefault(identity['city_id'], i)
         for vid in parse_bracketed(entry.get('videos')):
+            if vid in mapping_video_rows:
+                ambiguous_mapped.add(vid)
             mapping_video_rows.setdefault(vid, i)
     # A previous run may have replaced the queue and crashed before the mapping.
     # Repair from the durable queue even if this invocation has a different input.
@@ -290,15 +342,31 @@ def main():
         if not vid or not city:
             bad += 1
             continue
+        if vid in duplicate_queued:
+            raise ValueError(f'Duplicate queued video {vid!r}; reconcile jobs before appending')
+        if vid in ambiguous_mapped:
+            raise ValueError(f'Ambiguous mapped video {vid!r}; reconcile its city/interval '
+                             'assignments before appending')
         if vid in examined_ids:
             deduped += 1
             continue
         examined_ids.add(vid)
         had_queue, had_mapping = vid in queue_by_video, vid in mapping_video_rows
         queue = queue_by_video.get(vid)
+        if queue is not None and had_mapping:
+            _, queued_identity = identity_for(queue)
+            _, mapped_identity = identity_for(mapping_rows[mapping_video_rows[vid]])
+            if queued_identity['city_id'] != mapped_identity['city_id']:
+                raise ValueError(f'Conflicting city assignments for video {vid!r}; '
+                                 'reconcile the queue and mapping before appending')
         # Existing names, analysis windows and job/verification state are authoritative.
         # They must survive both an append and a retry of a half-written bridge.
         merged = dict(row)
+        if queue is None and had_mapping:
+            # Repair the other direction as well: an existing native mapping is
+            # authoritative even when its per-video queue is absent.
+            merged.update(mapped_video_metadata(mapping_rows[mapping_video_rows[vid]], vid))
+            city = merged['city']
         if queue:
             merged.update({key: value for key, value in queue.items() if value not in ('', None)})
             # An explicit review may enrich an unverified queued record, but a
@@ -386,10 +454,6 @@ def main():
                 updated[key] = previous.get(key, '')
         per_video[vid] = updated
         entry['video_provenance'] = json.dumps(per_video, ensure_ascii=False, sort_keys=True)
-        if had_mapping:
-            deduped += int(had_queue)
-            converted += int(not had_queue)
-            continue
         # Native formats: videos/upload_date/channel are FLAT lists ([a,b,...]);
         # time_of_day/start_time/end_time are NESTED ([[0],[1],...]).
         entry.setdefault('_videos', parse_bracketed(entry.get('videos')))
@@ -400,6 +464,18 @@ def main():
         entry.setdefault('_channel', parse_bracketed(entry.get('channel')))
         entry.setdefault('_vtype', parse_bracketed(entry.get('vehicle_type')))
         entry.setdefault('_fps', parse_bracketed(entry.get('fps_list')))
+        if had_mapping:
+            # Keep native aligned columns consistent with the authoritative queue,
+            # rather than changing only the JSON provenance for an edited window.
+            index = entry['_videos'].index(vid)
+            for key, value in (('_tod', tod), ('_start', start_sec),
+                               ('_end', end_sec if end_sec is not None else 0)):
+                if len(entry[key]) != len(entry['_videos']):
+                    raise ValueError(f'Cannot update {vid}: {key[1:]} is not aligned with videos')
+                entry[key][index] = f'[{value}]'
+            deduped += int(had_queue)
+            converted += int(not had_queue)
+            continue
         entry['_videos'].append(vid)
         entry['_tod'].append(f'[{tod}]')
         entry['_start'].append(f'[{start_sec}]')

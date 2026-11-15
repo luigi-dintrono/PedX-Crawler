@@ -237,6 +237,11 @@ make evaluate DECISIONS=data/outputs/runs/<id>/decisions.csv        # precision,
 It samples equally from accepted / metadata-rejected / visual-rejected decisions and
 reports precision (Wilson interval), per-stage false-rejection rate and a stratified
 recall with a bootstrap 95% interval. `error` decisions are excluded and counted.
+Repeated identical labels for one video count once; conflicting labels must be
+adjudicated. New label sheets include the decision run and timestamp. Evaluation
+rejects labels whose decision or stratum has changed, so keep the original decision
+logs with the sheet rather than substituting a later crawl. Legacy sheets without
+those binding columns remain usable, but cannot detect same-stratum decision changes.
 
 ## Feeding PedX-Insight
 
@@ -265,7 +270,14 @@ make bridge INSIGHT=/path/to/PedX-Insight DISCOVERY=data/outputs/discovery.csv
   idempotently and preserves existing names, intervals, status, review evidence and
   extension columns. Each file is replaced atomically; retries reconcile their
   video IDs independently, repairing a queue-only record after a partial update
-  even if a later invocation uses a different discovery input.
+  even if a later invocation uses a different discovery input. A mapping-only record
+  is recovered using its existing city, interval and per-video review; rediscovery
+  under another city's search cannot move it or expand its interval. Existing queue
+  edits to an interval update the corresponding native mapping slot as well as its
+  provenance. Converting a video with duplicate assignments or disagreement between
+  its queue and mapping city fails before writing either file; unrelated historical
+  rows remain unchanged. Legacy mappings with multiple
+  intervals for one video need an explicit queue row instead of a guessed interval.
 * Both files gain the additive identity columns. The queue carries per-video
   search/filter evidence, dates and clip intervals as scalar columns. The city
   mapping's `video_provenance` JSON stores this evidence under each video ID;
